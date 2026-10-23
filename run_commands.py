@@ -4,9 +4,9 @@ Run the Telegram command listener.
 Usage:
     python run_commands.py
 
-Keep this process running while you want the bot to respond to commands.
-It is separate from the daily scan — the scan writes to signals.db and sends
-alerts; this process answers on-demand commands.
+Keeps a process running that responds to bot commands. Separate from the
+daily scan — the scan writes to signals.db and sends alerts; this process
+answers on-demand commands.
 """
 
 import os

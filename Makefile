@@ -30,6 +30,9 @@ install: ## Create venv and install dependencies
 run: ## Run the bot once
 	uv run main.py
 
+listen: ## Run Polling Service
+	uv run run_commands.py
+
 test: ## Send a test Telegram message
 	uv run telegram_test.py
 

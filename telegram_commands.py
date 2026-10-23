@@ -1,6 +1,10 @@
 """
 Telegram command handlers for the Forex Signal Bot.
-Kept in a separate module so main.py stays focused on signal generation.
+Separate module so main.py stays focused on signal generation.
+
+Every dynamic value that lands in a Markdown message is passed through
+_md_safe() first. If Telegram still rejects the message, _send_with_fallback()
+retries it as plain text — so no command can crash on a parse error.
 """
 
 import os
@@ -15,14 +19,36 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Import from main.py — no side effects because main() is only run under __main__
 import main as bot_main
 
 DB_PATH = Path(__file__).parent / "signals.db"
 
 
 # ============================================================
-# HELPERS
+# MARKDOWN SAFETY HELPERS
+# ============================================================
+def _md_safe(text) -> str:
+    """Strip characters Telegram Markdown V1 treats as entity markers."""
+    return (str(text)
+            .replace("_", " ")
+            .replace("*", "")
+            .replace("`", "'")
+            .replace("[", "(")
+            .replace("]", ")")
+            .replace("~", "-"))
+
+
+async def _send_with_fallback(update: Update, text: str,
+                               parse_mode: str = "Markdown"):
+    """Send a message, falling back to plain text if Markdown parsing fails."""
+    try:
+        await update.message.reply_text(text, parse_mode=parse_mode)
+    except Exception:
+        await update.message.reply_text(text, parse_mode=None)
+
+
+# ============================================================
+# DATABASE HELPERS
 # ============================================================
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -47,23 +73,19 @@ def _now_utc() -> str:
 # ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 *Welcome to the Forex Signal Bot*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
+        "👋 *Welcome to the Masheroooo Forex Signal Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         "This bot scans the major forex pairs every day after the "
         "New York close and sends you ATR-adaptive, 1:3 risk-reward "
-        "signals with position sizing calculated for your account.\n"
-        "\n"
+        "signals with position sizing for your account.\n\n"
         "*Quick start:*\n"
         "• /help — see all available commands\n"
         "• /status — confirm the bot is running\n"
         "• /latest — get the most recent signal\n"
-        "• /scan — run a live scan right now\n"
-        "\n"
-        "⚠️ *This bot sends signals only. It does not place trades.*\n"
-        "You execute manually and manage your own risk."
+        "• /scan — run a live scan right now\n\n"
+        "⚠️ *Signals only. It does not place trades.*"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_with_fallback(update, text)
 
 
 # ============================================================
@@ -72,32 +94,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📖 *Available Commands*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         "*Information*\n"
         "`/start` — Welcome message\n"
         "`/help` — This help text\n"
         "`/about` — About the bot\n"
-        "`/status` — Check bot status\n"
-        "\n"
+        "`/status` — Check bot status\n\n"
         "*Signals & data*\n"
         "`/signals` — View recent forex signals\n"
         "`/latest` — Show the latest trading signal\n"
-        "`/performance` — Signal performance statistics\n"
-        "\n"
+        "`/performance` — Signal performance statistics\n\n"
         "*Configuration*\n"
         "`/pairs` — List monitored forex pairs\n"
         "`/balance` — View configured account balance\n"
         "`/risk` — Show current risk settings\n"
-        "`/settings` — Show all current bot settings\n"
-        "\n"
+        "`/settings` — Show all current bot settings\n\n"
         "*Live actions*\n"
         "`/scan` — Scan forex pairs for trading setups\n"
-        "`/diagnostics` — Show signal detection diagnostics\n"
-        "\n"
+        "`/diagnostics` — Show signal detection diagnostics\n\n"
         "Type any command to run it."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_with_fallback(update, text)
 
 
 # ============================================================
@@ -108,7 +125,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = _connect()
         try:
             last_run = conn.execute(
-                "SELECT started_at, finished_at, signals_sent, errors "
+                "SELECT started_at, signals_sent, errors "
                 "FROM runs ORDER BY id DESC LIMIT 1"
             ).fetchone()
             total_signals = conn.execute(
@@ -133,21 +150,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             "✅ *Bot Status*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🟢 Online\n"
-            f"🕐 {_now_utc()}\n"
-            f"\n"
+            f"🕐 {_now_utc()}\n\n"
             f"{status_line}\n"
-            f"{result_line}\n"
-            f"\n"
+            f"{result_line}\n\n"
             f"📊 Total signals: *{total_signals}*\n"
             f"🔓 Open signals: *{open_signals}*"
         )
     except Exception as e:
-        text = f"❌ *Status check failed*\n`{type(e).__name__}: {e}`"
+        text = f"❌ Status check failed: {_md_safe(e)}"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_with_fallback(update, text)
 
 
 # ============================================================
@@ -166,9 +180,9 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 
         if not rows:
-            await update.message.reply_text(
+            await _send_with_fallback(
+                update,
                 "📭 *No signals yet*\n\nRun `/scan` to perform a scan.",
-                parse_mode="Markdown",
             )
             return
 
@@ -182,9 +196,9 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "loss": "❌ loss",
                 "breakeven": "➖ be",
                 "cancelled": "🚫 cancelled",
-            }.get(r["outcome"], r["outcome"])
+            }.get(r["outcome"], _md_safe(r["outcome"]))
 
-            lines.append(f"{arrow} *{r['symbol']} {r['direction']}*  _{outcome}_")
+            lines.append(f"{arrow} *{r['symbol']} {r['direction']}*  {outcome}")
             lines.append(
                 f"  E `{_fmt_price(r['entry'])}` · "
                 f"SL `{_fmt_price(r['stop_loss'])}` · "
@@ -193,10 +207,10 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  Lots `{r['lot_size']}` · {date} UTC")
             lines.append("")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _send_with_fallback(update, "\n".join(lines))
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ *Error*\n`{type(e).__name__}: {e}`", parse_mode="Markdown"
+        await _send_with_fallback(
+            update, f"❌ Error: {_md_safe(e)}"
         )
 
 
@@ -214,9 +228,9 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 
         if not r:
-            await update.message.reply_text(
+            await _send_with_fallback(
+                update,
                 "📭 *No signals yet*\n\nRun `/scan` to perform a scan.",
-                parse_mode="Markdown",
             )
             return
 
@@ -227,41 +241,40 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "loss": "❌ loss",
             "breakeven": "➖ breakeven",
             "cancelled": "🚫 cancelled",
-        }.get(r["outcome"], r["outcome"])
+        }.get(r["outcome"], _md_safe(r["outcome"]))
         pnl_line = (
             f"PnL: `{_fmt_cents(r['pnl_cents'])}`\n"
             if r["pnl_cents"] is not None
             else ""
         )
         date = r["created_at"][:16].replace("T", " ")
+        zone_type = _md_safe(r["zone_type"]).capitalize()
+        sizing_src = _md_safe(r["sizing_source"])
 
         text = (
             f"📌 *Latest Signal*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{arrow} *{r['symbol']} {r['direction']}*\n"
-            f"Status: _{outcome}_\n"
-            f"\n"
+            f"Status: {outcome}\n\n"
             f"Entry: `{_fmt_price(r['entry'])}`\n"
             f"Stop Loss: `{_fmt_price(r['stop_loss'])}`\n"
-            f"Take Profit: `{_fmt_price(r['take_profit'])}`\n"
-            f"\n"
+            f"Take Profit: `{_fmt_price(r['take_profit'])}`\n\n"
             f"Risk: `{r['risk_pips']} pips` (1:3 RR)\n"
             f"ATR: `{r['atr_pips']} pips` "
             f"(stop = {r['atr_multiple']}× ATR)\n"
-            f"Lot Size: `{r['lot_size']}` ({r['sizing_source']})\n"
+            f"Lot Size: `{r['lot_size']}` ({sizing_src})\n"
             f"Risk ≈ `{_fmt_cents(r['risk_cents'])}`\n"
             f"{pnl_line}"
             f"\n"
-            f"Zone: {r['zone_type'].capitalize()} "
+            f"Zone: {zone_type} "
             f"({_fmt_price(r['zone_bottom'])} – {_fmt_price(r['zone_top'])})\n"
             f"Candle: `{r['signal_date'] or '—'}`\n"
             f"Created: `{date} UTC`"
         )
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await _send_with_fallback(update, text)
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ *Error*\n`{type(e).__name__}: {e}`", parse_mode="Markdown"
+        await _send_with_fallback(
+            update, f"❌ Error: {_md_safe(e)}"
         )
 
 
@@ -275,7 +288,7 @@ async def cmd_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• `{p}`")
     lines.append("")
     lines.append(f"*Total: {len(pairs)} pairs*")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await _send_with_fallback(update, "\n".join(lines))
 
 
 # ============================================================
@@ -288,17 +301,15 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"💰 *Account Balance*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Configured: `{balance:.2f}¢` ({balance/100:.2f} USD)\n"
         f"Target risk/trade: `{target_risk:.2f}¢` "
         f"({bot_main.RISK_PERCENT:.1f}%)\n"
         f"Max risk/trade: `{max_risk:.2f}¢` "
-        f"({bot_main.MAX_RISK_PERCENT:.1f}%)\n"
-        f"\n"
-        f"_Edit `ACCOUNT_BALANCE` in main.py to update._"
+        f"({bot_main.MAX_RISK_PERCENT:.1f}%)\n\n"
+        f"Edit ACCOUNT_BALANCE in main.py to update."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_with_fallback(update, text)
 
 
 # ============================================================
@@ -307,35 +318,31 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"⚖️ *Risk Settings*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Target risk/trade: `{bot_main.RISK_PERCENT:.1f}%`\n"
         f"Hard ceiling: `{bot_main.MAX_RISK_PERCENT:.1f}%`\n"
-        f"Risk:Reward: `1:3`\n"
-        f"\n"
+        f"Risk:Reward: `1:3`\n\n"
         f"*ATR-based stops*\n"
         f"ATR period: `{bot_main.ATR_PERIOD}`\n"
         f"ATR buffer: `{bot_main.ATR_BUFFER_MULT}× ATR`\n"
         f"Min stop: `{bot_main.MIN_STOP_ATR_MULT}× ATR`\n"
         f"Max stop: `{bot_main.MAX_STOP_ATR_MULT}× ATR`\n"
-        f"Spread buffer: `{bot_main.SPREAD_BUFFER_PIPS} pips`\n"
-        f"\n"
+        f"Spread buffer: `{bot_main.SPREAD_BUFFER_PIPS} pips`\n\n"
         f"*Broker*\n"
         f"Min lot: `{bot_main.BROKER_MIN_LOT}`\n"
-        f"Pip value/standard lot: `{bot_main.PIP_VALUE_STANDARD}¢`\n"
-        f"\n"
-        f"_Trades that would exceed the ceiling are skipped._"
+        f"Pip value/standard lot: `{bot_main.PIP_VALUE_STANDARD}¢`\n\n"
+        f"Trades that would exceed the ceiling are skipped."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_with_fallback(update, text)
 
 
 # ============================================================
 # /scan
 # ============================================================
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await _send_with_fallback(
+        update,
         "🔍 *Scanning…*\nThis may take 20–40 seconds for 11 pairs.",
-        parse_mode="Markdown",
     )
     try:
         results = []
@@ -343,14 +350,14 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 df = bot_main.fetch_data(pair, interval="1d", period="6mo")
                 if df.empty:
-                    results.append((pair, None, {"reasons": ["no_data"],
+                    results.append((pair, None, {"reasons": ["no data"],
                                                   "zones": 0, "sr": 0, "pools": 0}))
                     continue
                 signal, diag = bot_main.generate_signal(df, pair)
                 results.append((pair, signal, diag))
             except Exception as e:
                 results.append((pair, None,
-                                {"reasons": [f"error:{type(e).__name__}"],
+                                {"reasons": [f"error {type(e).__name__}"],
                                  "zones": 0, "sr": 0, "pools": 0}))
 
         signals = [(p, s) for p, s, d in results if s is not None]
@@ -363,17 +370,18 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for pair, sig in signals:
                 lots, risk_c, source = bot_main.calculate_lot_size(sig["risk_pips"])
                 arrow = "🟢" if sig["direction"] == "LONG" else "🔴"
+                safe_source = _md_safe(source)
+
                 lines.append(f"{arrow} *{sig['symbol']} {sig['direction']}*")
                 lines.append(
                     f"  E `{sig['entry']}` · SL `{sig['stop']}` · "
                     f"TP `{sig['target']}`"
                 )
                 if lots == 0.0:
-                    lines.append(f"  ⚠️ Position too large: _{source}_")
+                    # No italic wrapper — source may contain underscores
+                    lines.append(f"  ⚠️ Position too large: {safe_source}")
                 else:
-                    lines.append(
-                        f"  Lots `{lots}` · risk `{risk_c:.1f}¢`"
-                    )
+                    lines.append(f"  Lots `{lots}` · risk `{risk_c:.1f}¢`")
                 lines.append("")
         else:
             lines.append("📭 *No setups found*\n")
@@ -381,14 +389,16 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if no_signal:
             lines.append("*No signal:*")
             for pair, d in no_signal:
-                reasons = ",".join(d.get("reasons", []))[:60] or "—"
-                lines.append(f"• `{pair.replace('=X','')}`: {reasons}")
+                reasons = ",".join(d.get("reasons", []))[:80] or "—"
+                safe_reasons = _md_safe(reasons)
+                sym = pair.replace("=X", "")
+                lines.append(f"• `{sym}`: {safe_reasons}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _send_with_fallback(update, "\n".join(lines))
+
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ *Scan failed*\n`{type(e).__name__}: {e}`",
-            parse_mode="Markdown",
+        await _send_with_fallback(
+            update, f"❌ Scan failed: {_md_safe(e)}"
         )
 
 
@@ -403,9 +413,9 @@ async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "SELECT id FROM runs ORDER BY id DESC LIMIT 1"
             ).fetchone()
             if not last_run_id:
-                await update.message.reply_text(
+                await _send_with_fallback(
+                    update,
                     "📭 *No runs yet*\n\nRun `/scan` to perform a scan.",
-                    parse_mode="Markdown",
                 )
                 return
             run_id = last_run_id["id"]
@@ -419,9 +429,9 @@ async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 
         if not rows:
-            await update.message.reply_text(
+            await _send_with_fallback(
+                update,
                 "📭 *No diagnostics for the last run.*",
-                parse_mode="Markdown",
             )
             return
 
@@ -433,16 +443,15 @@ async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         for r in rows:
             sym = r["symbol"].replace("=X", "").ljust(7)
-            reasons = (r["reasons"] or "—")[:28]
+            reasons = _md_safe(r["reasons"] or "—")[:28]
             lines.append(
                 f"`{sym} {r['zones']:>3}  {r['sr_levels']:>3} {r['pools']:>3}   {reasons}`"
             )
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _send_with_fallback(update, "\n".join(lines))
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ *Error*\n`{type(e).__name__}: {e}`",
-            parse_mode="Markdown",
+        await _send_with_fallback(
+            update, f"❌ Error: {_md_safe(e)}"
         )
 
 
@@ -465,9 +474,9 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """).fetchone()
 
             if totals["total"] == 0:
-                await update.message.reply_text(
+                await _send_with_fallback(
+                    update,
                     "📭 *No signals yet*\n\nRun `/scan` to generate signals.",
-                    parse_mode="Markdown",
                 )
                 return
 
@@ -519,11 +528,10 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"`{p['symbol']:<7}` {closed_p:>2} trades · {wr:>5.1f}% WR"
                 )
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await _send_with_fallback(update, "\n".join(lines))
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ *Error*\n`{type(e).__name__}: {e}`",
-            parse_mode="Markdown",
+        await _send_with_fallback(
+            update, f"❌ Error: {_md_safe(e)}"
         )
 
 
@@ -533,36 +541,31 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚙️ *Current Settings*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         "*Account*\n"
         f"Balance: `{bot_main.ACCOUNT_BALANCE:.0f}¢`\n"
         f"Risk: `{bot_main.RISK_PERCENT:.1f}% → "
         f"{bot_main.MAX_RISK_PERCENT:.1f}%`\n"
-        f"Min lot: `{bot_main.BROKER_MIN_LOT}`\n"
-        "\n"
+        f"Min lot: `{bot_main.BROKER_MIN_LOT}`\n\n"
         "*Zones & retest*\n"
         f"ZONE_BODY_MULT: `{bot_main.ZONE_BODY_MULT}`\n"
         f"RETEST_BUFFER_PIPS: `{bot_main.RETEST_BUFFER_PIPS}`\n"
         f"SR_TOLERANCE_PIPS: `{bot_main.SR_TOLERANCE_PIPS}`\n"
         f"ZONE_LOOKBACK_BARS: `{bot_main.ZONE_LOOKBACK_BARS}`\n"
-        f"FRESH_ZONES_ONLY: `{bot_main.FRESH_ZONES_ONLY}`\n"
-        "\n"
+        f"FRESH_ZONES_ONLY: `{bot_main.FRESH_ZONES_ONLY}`\n\n"
         "*Stops & targets*\n"
         f"ATR({bot_main.ATR_PERIOD}) · "
         f"buffer `{bot_main.ATR_BUFFER_MULT}×`\n"
         f"Min stop: `{bot_main.MIN_STOP_ATR_MULT}× ATR`\n"
         f"Max stop: `{bot_main.MAX_STOP_ATR_MULT}× ATR`\n"
         f"Spread buffer: `{bot_main.SPREAD_BUFFER_PIPS} pips`\n"
-        f"RR: `1:3`\n"
-        "\n"
+        f"RR: `1:3`\n\n"
         "*Pairs*\n"
-        f"{len(bot_main.PAIRS)} monitored\n"
-        "\n"
+        f"{len(bot_main.PAIRS)} monitored\n\n"
         "*Timeframe*\n"
         f"Daily close hour: `{bot_main.DAILY_CLOSE_UTC_HOUR}:00 UTC`"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_with_fallback(update, text)
 
 
 # ============================================================
@@ -571,8 +574,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "ℹ️ *About This Bot*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         "A Python-based forex signal generator that combines:\n"
         "• Supply/demand zone detection\n"
         "• Liquidity pools (equal highs/lows)\n"
@@ -580,27 +582,23 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ATR-adaptive stop placement\n"
         "• Strict 1:3 risk-reward ratio\n"
         "• Dynamic position sizing "
-        "(target and hard ceiling)\n"
-        "\n"
+        "(target and hard ceiling)\n\n"
         "*Data*: Yahoo Finance daily candles\n"
         "*Timeframe*: Daily (multi-hour to multi-day holds)\n"
         "*Pairs*: 7 majors + 4 crosses\n"
-        "*Storage*: SQLite (`signals.db`)\n"
-        "\n"
+        "*Storage*: SQLite (`signals.db`)\n\n"
         "⚠️ *Important*\n"
         "This bot *sends signals only*. It does not connect to "
-        "your broker and does not place trades. All risk is yours.\n"
-        "\n"
+        "your broker and does not place trades. All risk is yours.\n\n"
         "Past performance does not guarantee future results."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send_with_fallback(update, text)
 
 
 # ============================================================
 # APPLICATION BUILDER
 # ============================================================
 def build_application() -> Application:
-    """Build and register all command handlers."""
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN not set")
@@ -608,19 +606,19 @@ def build_application() -> Application:
     app = Application.builder().token(token).build()
 
     handlers = {
-        "start":        cmd_start,
-        "help":         cmd_help,
-        "status":       cmd_status,
-        "signals":      cmd_signals,
-        "latest":       cmd_latest,
-        "pairs":        cmd_pairs,
-        "balance":      cmd_balance,
-        "risk":         cmd_risk,
-        "scan":         cmd_scan,
-        "diagnostics":  cmd_diagnostics,
-        "performance":  cmd_performance,
-        "settings":     cmd_settings,
-        "about":        cmd_about,
+        "start":       cmd_start,
+        "help":        cmd_help,
+        "status":      cmd_status,
+        "signals":     cmd_signals,
+        "latest":      cmd_latest,
+        "pairs":       cmd_pairs,
+        "balance":     cmd_balance,
+        "risk":        cmd_risk,
+        "scan":        cmd_scan,
+        "diagnostics": cmd_diagnostics,
+        "performance": cmd_performance,
+        "settings":    cmd_settings,
+        "about":       cmd_about,
     }
 
     for name, func in handlers.items():
