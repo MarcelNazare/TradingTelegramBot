@@ -14,12 +14,25 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime
 from telegram import Bot
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from the script's own directory (works regardless of CWD)
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
 
 # ============================================================
 # CONFIGURATION — WELTRADE MICRO (CENT) ACCOUNT
 # ============================================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
-CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    raise RuntimeError(
+        "TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env "
+        "or in the environment.")
+
 
 ACCOUNT_BALANCE    = 300.0    # 300 cents = $3 real
 RISK_PERCENT       = 5.0      # target risk per trade
