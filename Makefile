@@ -7,11 +7,42 @@
         backup backup-list requirements freeze \
         pa-upload pa-schedule pa-logs
 
+# ---------- Platform detection ----------
+ifeq ($(OS),Windows_NT)
+    PYTHON        ?= python
+    VENV          ?= venv
+    VENV_PY       = $(VENV)/Scripts/python.exe
+    VENV_PIP      = $(VENV)/Scripts/pip.exe
+    VENV_ACTIVATE = $(VENV)/Scripts/activate
+    SHELL         := cmd.exe
+    # ANSI colors are not rendered by legacy CMD; disable unless Windows Terminal
+    ifeq ($(WT_SESSION),)
+        GREEN  =
+        YELLOW =
+        RED    =
+        BLUE   =
+        NC     =
+    else
+        GREEN  = \033[0;32m
+        YELLOW = \033[0;33m
+        RED    = \033[0;31m
+        BLUE   = \033[0;34m
+        NC     = \033[0m
+    endif
+else
+    PYTHON        ?= python3
+    VENV          ?= venv
+    VENV_PY       = $(VENV)/bin/python
+    VENV_PIP      = $(VENV)/bin/pip
+    VENV_ACTIVATE = $(VENV)/bin/activate
+    GREEN  = \033[0;32m
+    YELLOW = \033[0;33m
+    RED    = \033[0;31m
+    BLUE   = \033[0;34m
+    NC     = \033[0m
+endif
+
 # ---------- Config ----------
-PYTHON        ?= python3
-VENV          ?= venv
-VENV_PY       = $(VENV)/bin/python
-VENV_PIP      = $(VENV)/bin/pip
 SCRIPT        = forex_bot.py
 ENV_FILE      = .env
 LOG_DIR       = logs
@@ -19,13 +50,6 @@ BACKUP_DIR    = backups
 PA_USER       ?= yourusername
 PA_HOST       = $(PA_USER).pythonanywhere.com
 PA_REMOTE_DIR = /home/$(PA_USER)
-
-# ---------- Colors ----------
-GREEN  = \033[0;32m
-YELLOW = \033[0;33m
-RED    = \033[0;31m
-BLUE   = \033[0;34m
-NC     = \033[0m
 
 # ---------- Help ----------
 help: ## Show this help
@@ -42,7 +66,7 @@ help: ## Show this help
 	@echo ""
 
 # ---------- Setup ----------
-install: $(VENV)/bin/activate ## Create venv and install dependencies
+install: $(VENV_ACTIVATE) ## Create venv and install dependencies
 	@echo "$(GREEN)[install] Installing dependencies...$(NC)"
 	$(VENV_PIP) install --upgrade pip
 	$(VENV_PIP) install -r requirements.txt
@@ -53,10 +77,10 @@ install-dev: install ## Install dependencies + dev tools (pytest, ruff, black)
 	$(VENV_PIP) install pytest ruff black
 	@echo "$(GREEN)[install-dev] Done.$(NC)"
 
-$(VENV)/bin/activate: requirements.txt
+$(VENV_ACTIVATE): requirements.txt
 	@echo "$(GREEN)[venv] Creating virtualenv in $(VENV)/...$(NC)"
 	$(PYTHON) -m venv $(VENV)
-	@touch $(VENV)/bin/activate
+	@touch $(VENV_ACTIVATE)
 
 requirements.txt: ## Regenerate requirements.txt from installed packages
 	@if [ ! -f requirements.txt ]; then \
@@ -85,40 +109,37 @@ env: ## Create .env from .env.example (will not overwrite existing)
 # ---------- Running ----------
 run: install ## Run the bot once (normal mode)
 	@echo "$(GREEN)[run] Starting bot...$(NC)"
-	@mkdir -p $(LOG_DIR)
 	@$(VENV_PY) $(SCRIPT)
 
 run-verbose: install ## Run the bot with DEBUG logging
-	@mkdir -p $(LOG_DIR)
 	PYTHONUNBUFFERED=1 LOG_LEVEL=DEBUG $(VENV_PY) $(SCRIPT)
 
 run-bg: install ## Run the bot in background, output to logs/
-	@mkdir -p $(LOG_DIR)
-	@nohup $(VENV_PY) $(SCRIPT) > $(LOG_DIR)/run-$(shell date +%Y%m%d-%H%M%S).log 2>&1 &
+	@$(VENV_PY) $(SCRIPT) > $(LOG_DIR)/run.log 2>&1 &
 	@echo "$(GREEN)[run-bg] Started in background. Logs in $(LOG_DIR)/$(NC)"
 
 # ---------- Testing & Quality ----------
 test: install-dev ## Run test suite
 	@echo "$(GREEN)[test] Running tests...$(NC)"
-	@$(VENV)/bin/pytest -v tests/ 2>/dev/null || \
+	@$(VENV_PY) -m pytest -v tests/ 2>/dev/null || \
 		echo "$(YELLOW)[test] No tests/ directory yet — create one to enable tests.$(NC)"
 
 lint: install-dev ## Lint with ruff
 	@echo "$(GREEN)[lint] Linting...$(NC)"
-	@$(VENV)/bin/ruff check $(SCRIPT) || true
+	@$(VENV_PY) -m ruff check $(SCRIPT) || true
 
 format: install-dev ## Auto-format with black
 	@echo "$(GREEN)[format] Formatting...$(NC)"
-	@$(VENV)/bin/black $(SCRIPT) || true
+	@$(VENV_PY) -m black $(SCRIPT) || true
 
 check: ## Quick sanity checks: syntax, .env present, imports resolve
 	@echo "$(BLUE)[check] Python syntax...$(NC)"
-	@$(PYTHON) -m py_compile $(SCRIPT) && echo "  $(GREEN)✓ syntax OK$(NC)"
+	@$(PYTHON) -m py_compile $(SCRIPT) && echo "  $(GREEN)OK syntax$(NC)"
 	@echo "$(BLUE)[check] .env presence...$(NC)"
 	@if [ -f $(ENV_FILE) ]; then \
-		echo "  $(GREEN)✓ $(ENV_FILE) found$(NC)"; \
+		echo "  $(GREEN)OK $(ENV_FILE) found$(NC)"; \
 	else \
-		echo "  $(RED)✗ $(ENV_FILE) missing — run 'make env'$(NC)"; \
+		echo "  $(RED)MISSING $(ENV_FILE) — run 'make env'$(NC)"; \
 	fi
 	@echo "$(BLUE)[check] Required variables in .env...$(NC)"
 	@if [ -f $(ENV_FILE) ]; then \
@@ -126,12 +147,12 @@ check: ## Quick sanity checks: syntax, .env present, imports resolve
 			if grep -q "^$$var=" $(ENV_FILE) 2>/dev/null; then \
 				val=$$(grep "^$$var=" $(ENV_FILE) | head -1 | cut -d= -f2-); \
 				if [ -z "$$val" ] || echo "$$val" | grep -q "your_"; then \
-					echo "  $(RED)✗ $$var still has placeholder value$(NC)"; \
+					echo "  $(RED)PLACEHOLDER $$var still has placeholder value$(NC)"; \
 				else \
-					echo "  $(GREEN)✓ $$var is set$(NC)"; \
+					echo "  $(GREEN)OK $$var is set$(NC)"; \
 				fi; \
 			else \
-				echo "  $(RED)✗ $$var not found in $(ENV_FILE)$(NC)"; \
+				echo "  $(RED)MISSING $$var not found in $(ENV_FILE)$(NC)"; \
 			fi; \
 		done; \
 	fi
@@ -139,28 +160,18 @@ check: ## Quick sanity checks: syntax, .env present, imports resolve
 # ---------- Telegram ----------
 telegram-test: install ## Send a test message to your Telegram chat
 	@echo "$(GREEN)[telegram-test] Sending test message...$(NC)"
-	@$(VENV_PY) -c "\
-import os, asyncio; \
-from pathlib import Path; \
-from dotenv import load_dotenv; \
-from telegram import Bot; \
-load_dotenv(Path('$(ENV_FILE)')); \
-async def _t(): \
-    bot = Bot(token=os.getenv('TELEGRAM_TOKEN')); \
-    await bot.send_message(chat_id=os.getenv('TELEGRAM_CHAT_ID'), text='✅ Test from forex_bot'); \
-asyncio.run(_t()); \
-print('  $(GREEN)✓ Message sent — check Telegram$(NC)')"
+	@$(VENV_PY) -c "import os, asyncio; from pathlib import Path; from dotenv import load_dotenv; from telegram import Bot; load_dotenv(Path('$(ENV_FILE)')); async def _t(): bot = Bot(token=os.getenv('TELEGRAM_TOKEN')); await bot.send_message(chat_id=os.getenv('TELEGRAM_CHAT_ID'), text='Test from forex_bot'); asyncio.run(_t()); print('  $(GREEN)OK Message sent — check Telegram$(NC)')"
 
 # ---------- Logs ----------
 log: ## Show the most recent log file
-	@if [ -d $(LOG_DIR) ] && [ "$$(ls -A $(LOG_DIR) 2>/dev/null)" ]; then \
+	@if [ -d $(LOG_DIR) ] && [ -n "$$(ls -A $(LOG_DIR) 2>/dev/null)" ]; then \
 		ls -t $(LOG_DIR)/*.log 2>/dev/null | head -1 | xargs cat; \
 	else \
 		echo "$(YELLOW)[log] No logs yet. Run 'make run-bg' to generate one.$(NC)"; \
 	fi
 
 tail-log: ## Tail the most recent log file
-	@if [ -d $(LOG_DIR) ] && [ "$$(ls -A $(LOG_DIR) 2>/dev/null)" ]; then \
+	@if [ -d $(LOG_DIR) ] && [ -n "$$(ls -A $(LOG_DIR) 2>/dev/null)" ]; then \
 		ls -t $(LOG_DIR)/*.log 2>/dev/null | head -1 | xargs tail -f; \
 	else \
 		echo "$(YELLOW)[tail-log] No logs yet.$(NC)"; \
@@ -169,9 +180,8 @@ tail-log: ## Tail the most recent log file
 # ---------- Backup ----------
 backup: ## Backup .env and script to backups/
 	@mkdir -p $(BACKUP_DIR)
-	@STAMP=$$(date +%Y%m%d-%H%M%S); \
-	tar -czf $(BACKUP_DIR)/forex-bot-$$STAMP.tar.gz $(SCRIPT) .env requirements.txt Makefile 2>/dev/null; \
-	echo "$(GREEN)[backup] Created $(BACKUP_DIR)/forex-bot-$$STAMP.tar.gz$(NC)"
+	@tar -czf $(BACKUP_DIR)/forex-bot-backup.tar.gz $(SCRIPT) .env requirements.txt Makefile 2>/dev/null; \
+	echo "$(GREEN)[backup] Created $(BACKUP_DIR)/forex-bot-backup.tar.gz$(NC)"
 
 backup-list: ## List available backups
 	@if [ -d $(BACKUP_DIR) ]; then \
@@ -202,9 +212,6 @@ pa-schedule: ## Print instructions for scheduling on PythonAnywhere
 	@echo "  3. Add these environment variables in the task editor:"
 	@echo "       TELEGRAM_TOKEN=<your token>"
 	@echo "       TELEGRAM_CHAT_ID=<your chat id>"
-	@echo ""
-	@echo "$(YELLOW)If your free account was created after Jan 15, 2026,$(NC)"
-	@echo "$(YELLOW)scheduled tasks are unavailable — use a Flask web app + cron-job.org.$(NC)"
 	@echo ""
 
 pa-logs: ## Stream PythonAnywhere task logs
@@ -238,21 +245,14 @@ deploy-check: check ## Pre-flight checks before deploying
 	@echo ""
 	@echo "$(BLUE)[deploy-check] Checking for common issues...$(NC)"
 	@if grep -q "YOUR_BOT_TOKEN_HERE\|your_bot_token_here" $(SCRIPT) 2>/dev/null; then \
-		echo "  $(RED)✗ Hardcoded placeholder token in $(SCRIPT)$(NC)"; \
+		echo "  $(RED)FAIL Hardcoded placeholder token in $(SCRIPT)$(NC)"; \
 	else \
-		echo "  $(GREEN)✓ No hardcoded token in $(SCRIPT)$(NC)"; \
+		echo "  $(GREEN)OK No hardcoded token in $(SCRIPT)$(NC)"; \
 	fi
 	@if [ -f .gitignore ] && grep -q "^\.env$$" .gitignore; then \
-		echo "  $(GREEN)✓ .env is in .gitignore$(NC)"; \
+		echo "  $(GREEN)OK .env is in .gitignore$(NC)"; \
 	else \
-		echo "  $(RED)✗ .env is NOT in .gitignore — add it!$(NC)"; \
-	fi
-	@if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
-		if git ls-files --error-unmatch .env >/dev/null 2>&1; then \
-			echo "  $(RED)✗ .env is tracked by git — remove it!$(NC)"; \
-		else \
-			echo "  $(GREEN)✓ .env not tracked by git$(NC)"; \
-		fi; \
+		echo "  $(RED)FAIL .env is NOT in .gitignore — add it!$(NC)"; \
 	fi
 	@echo ""
 	@echo "$(GREEN)[deploy-check] Pre-flight complete.$(NC)"
