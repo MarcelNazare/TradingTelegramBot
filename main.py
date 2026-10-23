@@ -7,38 +7,47 @@ Forex Supply/Demand + Liquidity Trading Bot
 - Designed for PythonAnywhere free tier
 """
 
+# ============================================================
+# WARNING SUPPRESSION — must come before importing yfinance/pandas
+# ============================================================
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*Pandas4Warning.*")
+warnings.filterwarnings("ignore", message=".*inplace.*")
+
 import os
 import asyncio
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime
-from telegram import Bot
 from pathlib import Path
 from dotenv import load_dotenv
+from telegram import Bot
 
-# Load .env from the script's own directory (works regardless of CWD)
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-
-# ============================================================
-# CONFIGURATION — WELTRADE MICRO (CENT) ACCOUNT
-# ============================================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError(
         "TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env "
-        "or in the environment.")
+        "or in the environment."
+    )
 
-
-ACCOUNT_BALANCE    = 300.0    # 300 cents = $3 real
+# ============================================================
+# CONFIGURATION — WELTRADE MICRO (CENT) ACCOUNT
+# ============================================================
+ACCOUNT_BALANCE    = 300.0    # cents (300¢ = $3 real)
 RISK_PERCENT       = 5.0      # target risk per trade
 MAX_RISK_PERCENT   = 10.0     # hard ceiling — skip if minimum lot exceeds this
 BROKER_MIN_LOT     = 0.01     # Weltrade micro minimum
-PIP_VALUE_STANDARD = 0.10     # pip value (cents) per 1.0 cent-lot — VERIFY WITH BROKER
+PIP_VALUE_STANDARD = 0.10     # cents per pip per 1.0 cent-lot — MUST be calibrated
 SPREAD_BUFFER_PIPS = 2.0
 
 # ATR stop tuning
@@ -47,6 +56,9 @@ ATR_BUFFER_MULT   = 0.3       # ATR buffer beyond zone edge
 MIN_STOP_ATR_MULT = 1.0       # minimum stop distance from entry, in ATR
 MAX_STOP_ATR_MULT = 3.0       # maximum stop; skip trade if exceeded
 
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()   # INFO or DEBUG
+
 PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
          "AUDUSD=X", "USDCAD=X", "NZDUSD=X"]
 
@@ -54,10 +66,10 @@ PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
 # DATA
 # ============================================================
 def fetch_data(symbol: str, interval: str = "1d", period: str = "6mo") -> pd.DataFrame:
-    df = yf.download(symbol, interval=interval, period=period, progress=False, auto_adjust=False)
+    df = yf.download(symbol, interval=interval, period=period,
+                     progress=False, auto_adjust=False)
     if df.empty:
         return pd.DataFrame()
-    # yfinance sometimes returns multi-index columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
@@ -143,19 +155,39 @@ def find_support_resistance(df: pd.DataFrame, window: int = 10):
     return sr
 
 # ============================================================
-# SIGNAL GENERATION
+# SIGNAL GENERATION (with telemetry)
 # ============================================================
 def generate_signal(df: pd.DataFrame, symbol: str):
+    """
+    Returns (signal_dict, diagnostics_dict).
+    signal_dict is None when no setup qualifies.
+    diagnostics_dict always explains why.
+    """
+    diag = {
+        "zones": 0, "sr": 0, "pools": 0,
+        "reasons": [],
+    }
+
     if len(df) < 60:
-        return None
+        diag["reasons"].append("insufficient_data")
+        return None, diag
 
     atr = calculate_atr(df).iloc[-1]
     if pd.isna(atr) or atr <= 0:
-        return None
+        diag["reasons"].append("no_atr")
+        return None, diag
 
     zones = find_supply_demand_zones(df)
     pools = find_liquidity_pools(df)
     sr    = find_support_resistance(df)
+
+    diag["zones"] = len(zones)
+    diag["sr"]    = len(sr)
+    diag["pools"] = len(pools)
+
+    if not zones:
+        diag["reasons"].append("no_zones")
+        return None, diag
 
     last_close = df["close"].iloc[-1]
     last_low   = df["low"].iloc[-1]
@@ -167,13 +199,16 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         if zone["type"] != "demand":
             continue
         if not (zone["bottom"] <= last_low <= zone["top"]):
+            diag["reasons"].append("long_no_retest")
             continue
         if not any(abs(s["level"] - zone["bottom"]) <= 5 * pip
                    for s in sr if s["type"] == "support"):
+            diag["reasons"].append("long_no_support")
             continue
         if any(p["type"] == "equal_lows"
                and zone["bottom"] - 10 * pip <= p["level"] <= zone["bottom"]
                for p in pools):
+            diag["reasons"].append("long_liquidity_trap")
             continue
 
         entry     = last_close
@@ -182,6 +217,7 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr)
 
         if stop_dist > MAX_STOP_ATR_MULT * atr:
+            diag["reasons"].append("long_stop_too_wide")
             continue
 
         stop   = entry - stop_dist
@@ -197,20 +233,23 @@ def generate_signal(df: pd.DataFrame, symbol: str):
             "atr_pips":     round(atr / pip, 1),
             "atr_multiple": round(stop_dist / atr, 2),
             "zone":         zone,
-        }
+        }, diag
 
     # ---------------- SHORT ----------------
     for zone in zones:
         if zone["type"] != "supply":
             continue
         if not (zone["bottom"] <= last_high <= zone["top"]):
+            diag["reasons"].append("short_no_retest")
             continue
         if not any(abs(s["level"] - zone["top"]) <= 5 * pip
                    for s in sr if s["type"] == "resistance"):
+            diag["reasons"].append("short_no_resistance")
             continue
         if any(p["type"] == "equal_highs"
                and zone["top"] <= p["level"] <= zone["top"] + 10 * pip
                for p in pools):
+            diag["reasons"].append("short_liquidity_trap")
             continue
 
         entry     = last_close
@@ -219,6 +258,7 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr)
 
         if stop_dist > MAX_STOP_ATR_MULT * atr:
+            diag["reasons"].append("short_stop_too_wide")
             continue
 
         stop   = entry + stop_dist
@@ -234,17 +274,17 @@ def generate_signal(df: pd.DataFrame, symbol: str):
             "atr_pips":     round(atr / pip, 1),
             "atr_multiple": round(stop_dist / atr, 2),
             "zone":         zone,
-        }
+        }, diag
 
-    return None
+    if not diag["reasons"]:
+        diag["reasons"].append("no_matching_direction")
+    return None, diag
 
 # ============================================================
 # POSITION SIZING — dynamic with hard risk ceiling
 # ============================================================
 def calculate_lot_size(stop_pips: float):
-    """
-    Returns (lot_size, risk_cents, source) or (0.0, 0.0, reason) if skipped.
-    """
+    """Returns (lot_size, risk_cents, source) or (0.0, risk_cents, reason)."""
     if stop_pips <= 0:
         return 0.0, 0.0, "invalid_stop"
 
@@ -276,9 +316,9 @@ def calculate_lot_size(stop_pips: float):
 async def send_telegram(signal: dict, lot_size: float,
                         risk_cents: float, source: str):
     bot = Bot(token=TELEGRAM_TOKEN)
-    risk_usd = risk_cents / 100
+    risk_usd   = risk_cents / 100
     reward_usd = risk_usd * 3
-    risk_pct = (risk_cents / ACCOUNT_BALANCE) * 100
+    risk_pct   = (risk_cents / ACCOUNT_BALANCE) * 100
 
     msg = (
         f"🚨 *{signal['symbol']} {signal['direction']}*\n"
@@ -296,7 +336,7 @@ async def send_telegram(signal: dict, lot_size: float,
         f"({signal['zone']['bottom']:.5f} – {signal['zone']['top']:.5f})\n"
         f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
     )
-    await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
 
 # ============================================================
 # MAIN
@@ -304,7 +344,8 @@ async def send_telegram(signal: dict, lot_size: float,
 def main():
     print(f"[START] {datetime.utcnow().isoformat()} UTC | "
           f"Balance={ACCOUNT_BALANCE}¢ | TargetRisk={RISK_PERCENT}% | "
-          f"MaxRisk={MAX_RISK_PERCENT}% | PipValue={PIP_VALUE_STANDARD}")
+          f"MaxRisk={MAX_RISK_PERCENT}% | PipValue={PIP_VALUE_STANDARD} | "
+          f"LogLevel={LOG_LEVEL}")
 
     signals_sent = 0
     for pair in PAIRS:
@@ -314,9 +355,13 @@ def main():
                 print(f"[SKIP] {pair}: no data")
                 continue
 
-            signal = generate_signal(df, pair)
+            signal, diag = generate_signal(df, pair)
+
+            # Always print filter telemetry
             if signal is None:
-                print(f"[NONE] {pair}: no signal")
+                reasons = ",".join(diag["reasons"]) or "unknown"
+                print(f"[NONE] {pair}: zones={diag['zones']} "
+                      f"sr={diag['sr']} pools={diag['pools']} | {reasons}")
                 continue
 
             lots, risk_cents, source = calculate_lot_size(signal["risk_pips"])
@@ -329,7 +374,8 @@ def main():
 
             print(f"[SIGNAL] {pair} {signal['direction']} | "
                   f"lots={lots} | risk={risk_cents:.1f}¢ "
-                  f"({(risk_cents/ACCOUNT_BALANCE)*100:.1f}%) | source={source}")
+                  f"({(risk_cents/ACCOUNT_BALANCE)*100:.1f}%) | source={source} | "
+                  f"zones={diag['zones']} sr={diag['sr']} pools={diag['pools']}")
 
             asyncio.run(send_telegram(signal, lots, risk_cents, source))
             signals_sent += 1
