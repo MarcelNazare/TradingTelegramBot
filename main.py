@@ -10,11 +10,6 @@ Forex Supply/Demand + Liquidity Trading Bot
 # ============================================================
 # WARNING SUPPRESSION — must come before importing yfinance/pandas
 # ============================================================
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*Pandas4Warning.*")
-warnings.filterwarnings("ignore", message=".*inplace.*")
-
 import os
 import asyncio
 import pandas as pd
@@ -24,6 +19,19 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Bot
+
+# Warnings
+import warnings
+
+# Belt: silence everything from third-party libs at import time
+warnings.filterwarnings("ignore")
+
+# Suspenders: silence pandas' custom warning classes specifically
+try:
+    from pandas.errors import Pandas4Warning
+    warnings.simplefilter("ignore", Pandas4Warning)
+except ImportError:
+    pass
 
 # ============================================================
 # ENVIRONMENT
@@ -59,8 +67,16 @@ MAX_STOP_ATR_MULT = 3.0       # maximum stop; skip trade if exceeded
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()   # INFO or DEBUG
 
-PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
-         "AUDUSD=X", "USDCAD=X", "NZDUSD=X"]
+PAIRS = [
+    # Tier 1 — majors (7)
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
+    "AUDUSD=X", "USDCAD=X", "NZDUSD=X",
+    # Tier 2 — selective crosses (4)
+    "EURGBP=X",   # tight spread, clean structure
+    "EURJPY=X",   # very popular, trending
+    "GBPJPY=X",   # high vol, expect skips
+    "AUDJPY=X",   # risk-on proxy
+]
 
 # ============================================================
 # DATA
