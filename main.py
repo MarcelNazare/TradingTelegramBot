@@ -3,20 +3,17 @@ Forex Supply/Demand + Liquidity Trading Bot
 - Weltrade Micro (Cent) account edition
 - 1:3 RR, ATR-adaptive stops, dynamic 5%/10% risk
 - Daily timeframe, majors + selective crosses
-- SQLite persistence (signals, runs, pair_diagnostics)
+- Postgres (Neon) persistence — signals, runs, pair_diagnostics
+- Full Telegram command interface (13 commands)
 
-Changes in this version
-  1. Zones are now taken from the MOST RECENT bars (was: oldest bars).
-  2. Zones are invalidated once price closes through them. Touched-but-not-
-     broken zones stay valid (FRESH_ZONES_ONLY=False).
-  3. Real de-duplication: one signal per (symbol, direction, candle date),
-     plus no new signal while one is still open for that symbol+direction.
-  4. The still-forming daily candle is dropped before analysis.
-  5. SPREAD_BUFFER_PIPS is now added to the stop distance.
-  6. Open signals are checked against later candles (win/loss/pnl filled in).
-  7. Tuning: ZONE_BODY_MULT=1.2, RETEST_BUFFER_PIPS=5, SR_TOLERANCE_PIPS=10.
-  8. Warning suppression now also targets yfinance's own logger, since
-     Pandas4Warning is routed through logging, not the warnings module.
+Run modes:
+    python main.py            -> scan once and exit
+    python main.py --listen   -> (handled by web_listener.py on Render)
+
+Requires env vars:
+    TELEGRAM_TOKEN
+    TELEGRAM_CHAT_ID
+    DATABASE_URL  (Postgres connection string, e.g. from neon.tech)
 """
 
 # ============================================================
@@ -28,8 +25,8 @@ warnings.filterwarnings("ignore")
 import logging
 logging.disable(logging.WARNING)
 
-# yfinance routes some messages through its own logger — silence it by name
-for _logger_name in ("yfinance", "peewee", "urllib3", "requests", "charset_normalizer"):
+for _logger_name in ("yfinance", "peewee", "urllib3", "requests",
+                     "charset_normalizer", "httpx", "httpcore"):
     _lg = logging.getLogger(_logger_name)
     _lg.setLevel(logging.CRITICAL)
     _lg.propagate = False
@@ -43,13 +40,17 @@ except Exception:
     pass
 
 import os
+import sys
+import time
 import asyncio
-import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timezone
-from pathlib import Path
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 from telegram import Bot
 
@@ -61,9 +62,12 @@ load_dotenv(dotenv_path=env_path)
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DATABASE_URL     = os.getenv("DATABASE_URL")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL must be set (Neon Postgres connection string).")
 
 # ============================================================
 # CONFIG
@@ -80,18 +84,14 @@ ATR_BUFFER_MULT   = 0.3
 MIN_STOP_ATR_MULT = 1.0
 MAX_STOP_ATR_MULT = 3.0
 
-# --- Tuning knobs -------------------------------------------------
-RETEST_BUFFER_PIPS = 5.0     # was 3.0 — more retest tolerance
-SR_TOLERANCE_PIPS  = 10.0    # was 5 (hardcoded) — more S/R confluence
-ZONE_BODY_MULT     = 1.2     # was 1.5 (hardcoded) — more zones
+RETEST_BUFFER_PIPS = 5.0
+SR_TOLERANCE_PIPS  = 10.0
+ZONE_BODY_MULT     = 1.2
 
 ZONE_LOOKBACK_BARS = 50
-FRESH_ZONES_ONLY   = False   # was True — keep touched-but-not-broken zones
-# ------------------------------------------------------------------
+FRESH_ZONES_ONLY   = False
 
 DAILY_CLOSE_UTC_HOUR = 22
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 PAIRS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
@@ -99,110 +99,116 @@ PAIRS = [
     "EURGBP=X", "EURJPY=X", "GBPJPY=X", "AUDJPY=X",
 ]
 
-DB_PATH = Path(__file__).parent / "signals.db"
-
 # ============================================================
-# DATABASE
+# DATABASE (Postgres via Neon)
 # ============================================================
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
-
-def _column_exists(conn, table, column) -> bool:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r["name"] == column for r in rows)
+def db_connect():
+    """Open a Postgres connection with retry logic for Neon cold-starts."""
+    for attempt in range(3):
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = False
+            return conn
+        except psycopg2.OperationalError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
 
 def db_init():
     conn = db_connect()
     try:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at      TEXT NOT NULL,
-            signal_date     TEXT,
-            symbol          TEXT NOT NULL,
-            direction       TEXT NOT NULL,
-            entry           REAL NOT NULL,
-            stop_loss       REAL NOT NULL,
-            take_profit     REAL NOT NULL,
-            risk_pips       REAL NOT NULL,
-            atr_pips        REAL NOT NULL,
-            atr_multiple    REAL NOT NULL,
-            lot_size        REAL NOT NULL,
-            risk_cents      REAL NOT NULL,
-            sizing_source   TEXT NOT NULL,
-            zone_type       TEXT NOT NULL,
-            zone_top        REAL NOT NULL,
-            zone_bottom     REAL NOT NULL,
-            outcome         TEXT DEFAULT 'open',
-            exit_price      REAL,
-            closed_at       TEXT,
-            pnl_cents       REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_signals_created
-            ON signals(created_at);
-        CREATE INDEX IF NOT EXISTS idx_signals_symbol
-            ON signals(symbol, created_at);
-
-        CREATE TABLE IF NOT EXISTS runs (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at      TEXT NOT NULL,
-            finished_at     TEXT,
-            pairs_scanned   INTEGER DEFAULT 0,
-            signals_sent    INTEGER DEFAULT 0,
-            signals_skipped INTEGER DEFAULT 0,
-            errors          INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS pair_diagnostics (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id      INTEGER NOT NULL,
-            symbol      TEXT NOT NULL,
-            zones       INTEGER,
-            sr_levels   INTEGER,
-            pools       INTEGER,
-            reasons     TEXT,
-            FOREIGN KEY(run_id) REFERENCES runs(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_diag_run
-            ON pair_diagnostics(run_id);
-        """)
-
-        if not _column_exists(conn, "signals", "signal_date"):
-            conn.execute("ALTER TABLE signals ADD COLUMN signal_date TEXT")
-
-        conn.execute("""
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id              SERIAL PRIMARY KEY,
+                created_at      TEXT NOT NULL,
+                signal_date     TEXT,
+                symbol          TEXT NOT NULL,
+                direction       TEXT NOT NULL,
+                entry           DOUBLE PRECISION NOT NULL,
+                stop_loss       DOUBLE PRECISION NOT NULL,
+                take_profit     DOUBLE PRECISION NOT NULL,
+                risk_pips       DOUBLE PRECISION NOT NULL,
+                atr_pips        DOUBLE PRECISION NOT NULL,
+                atr_multiple    DOUBLE PRECISION NOT NULL,
+                lot_size        DOUBLE PRECISION NOT NULL,
+                risk_cents      DOUBLE PRECISION NOT NULL,
+                sizing_source   TEXT NOT NULL,
+                zone_type       TEXT NOT NULL,
+                zone_top        DOUBLE PRECISION NOT NULL,
+                zone_bottom     DOUBLE PRECISION NOT NULL,
+                outcome         TEXT DEFAULT 'open',
+                exit_price      DOUBLE PRECISION,
+                closed_at       TEXT,
+                pnl_cents       DOUBLE PRECISION
+            );
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signals_created
+                ON signals(created_at);
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signals_symbol
+                ON signals(symbol, created_at);
+            """)
+            cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique
-            ON signals(symbol, direction, signal_date)
-        """)
+                ON signals(symbol, direction, signal_date);
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS runs (
+                id              SERIAL PRIMARY KEY,
+                started_at      TEXT NOT NULL,
+                finished_at     TEXT,
+                pairs_scanned   INTEGER DEFAULT 0,
+                signals_sent    INTEGER DEFAULT 0,
+                signals_skipped INTEGER DEFAULT 0,
+                errors          INTEGER DEFAULT 0
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS pair_diagnostics (
+                id          SERIAL PRIMARY KEY,
+                run_id      INTEGER NOT NULL REFERENCES runs(id),
+                symbol      TEXT NOT NULL,
+                zones       INTEGER,
+                sr_levels   INTEGER,
+                pools       INTEGER,
+                reasons     TEXT
+            );
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_diag_run
+                ON pair_diagnostics(run_id);
+            """)
         conn.commit()
     finally:
         conn.close()
 
-def db_insert_run_start(started_at: str) -> int:
+def db_insert_run_start(started_at):
     conn = db_connect()
     try:
-        cur = conn.execute(
-            "INSERT INTO runs (started_at) VALUES (?)", (started_at,)
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO runs (started_at) VALUES (%s) RETURNING id",
+                (started_at,)
+            )
+            run_id = cur.fetchone()[0]
         conn.commit()
-        return cur.lastrowid
+        return run_id
     finally:
         conn.close()
 
 def db_finish_run(run_id, pairs_scanned, signals_sent, signals_skipped, errors):
     conn = db_connect()
     try:
-        conn.execute("""
-            UPDATE runs SET
-                finished_at = ?, pairs_scanned = ?, signals_sent = ?,
-                signals_skipped = ?, errors = ?
-            WHERE id = ?
-        """, (datetime.now(timezone.utc).isoformat(),
-              pairs_scanned, signals_sent, signals_skipped, errors, run_id))
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE runs SET finished_at=%s, pairs_scanned=%s,
+                                signals_sent=%s, signals_skipped=%s, errors=%s
+                WHERE id=%s
+            """, (datetime.now(timezone.utc).isoformat(),
+                  pairs_scanned, signals_sent, signals_skipped, errors, run_id))
         conn.commit()
     finally:
         conn.close()
@@ -210,50 +216,56 @@ def db_finish_run(run_id, pairs_scanned, signals_sent, signals_skipped, errors):
 def db_insert_diagnostic(run_id, symbol, diag):
     conn = db_connect()
     try:
-        conn.execute("""
-            INSERT INTO pair_diagnostics
-                (run_id, symbol, zones, sr_levels, pools, reasons)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (run_id, symbol, diag["zones"], diag["sr"], diag["pools"],
-              ",".join(diag["reasons"])))
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pair_diagnostics
+                    (run_id, symbol, zones, sr_levels, pools, reasons)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (run_id, symbol, diag["zones"], diag["sr"], diag["pools"],
+                  ",".join(diag["reasons"])))
         conn.commit()
     finally:
         conn.close()
 
-def db_insert_signal(signal, lot_size, risk_cents, source) -> bool:
+def db_insert_signal(signal, lot_size, risk_cents, source):
     conn = db_connect()
     try:
-        cur = conn.execute("""
-            INSERT OR IGNORE INTO signals
-                (created_at, signal_date, symbol, direction, entry, stop_loss,
-                 take_profit, risk_pips, atr_pips, atr_multiple,
-                 lot_size, risk_cents, sizing_source, zone_type,
-                 zone_top, zone_bottom)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            datetime.now(timezone.utc).isoformat(),
-            signal["signal_date"],
-            signal["symbol"], signal["direction"],
-            signal["entry"], signal["stop"], signal["target"],
-            signal["risk_pips"], signal["atr_pips"], signal["atr_multiple"],
-            lot_size, risk_cents, source,
-            signal["zone"]["type"],
-            signal["zone"]["top"], signal["zone"]["bottom"],
-        ))
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO signals
+                    (created_at, signal_date, symbol, direction, entry, stop_loss,
+                     take_profit, risk_pips, atr_pips, atr_multiple,
+                     lot_size, risk_cents, sizing_source, zone_type,
+                     zone_top, zone_bottom)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (symbol, direction, signal_date) DO NOTHING
+                RETURNING id
+            """, (
+                datetime.now(timezone.utc).isoformat(),
+                signal["signal_date"],
+                signal["symbol"], signal["direction"],
+                signal["entry"], signal["stop"], signal["target"],
+                signal["risk_pips"], signal["atr_pips"], signal["atr_multiple"],
+                lot_size, risk_cents, source,
+                signal["zone"]["type"],
+                signal["zone"]["top"], signal["zone"]["bottom"],
+            ))
+            inserted = cur.fetchone() is not None
         conn.commit()
-        return cur.rowcount > 0
+        return inserted
     finally:
         conn.close()
 
-def db_has_open_signal(symbol, direction) -> bool:
+def db_has_open_signal(symbol, direction):
     conn = db_connect()
     try:
-        row = conn.execute("""
-            SELECT 1 FROM signals
-            WHERE symbol = ? AND direction = ? AND outcome = 'open'
-            LIMIT 1
-        """, (symbol, direction)).fetchone()
-        return row is not None
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM signals
+                WHERE symbol=%s AND direction=%s AND outcome='open'
+                LIMIT 1
+            """, (symbol, direction))
+            return cur.fetchone() is not None
     finally:
         conn.close()
 
@@ -300,7 +312,6 @@ def _zone_still_valid(df, kind, top, bottom, impulse_idx):
     if after.empty:
         return True
     prior = after.iloc[:-1]
-
     if kind == "demand":
         if (after["close"] < bottom).any():
             return False
@@ -317,28 +328,23 @@ def find_supply_demand_zones(df, lookback=ZONE_LOOKBACK_BARS):
     avg_body = (df["close"] - df["open"]).abs().rolling(20).mean().iloc[-1]
     if pd.isna(avg_body) or avg_body <= 0:
         return []
-
     n = len(df)
     start = max(2, n - 1 - lookback)
     zones = []
-
     for i in range(start, n - 1):
         body = abs(df["close"].iloc[i] - df["open"].iloc[i])
         if body < ZONE_BODY_MULT * avg_body:
             continue
         prev = i - 1
-
         if df["close"].iloc[i] > df["open"].iloc[i]:
             if df["close"].iloc[prev] < df["open"].iloc[prev]:
-                top    = df["high"].iloc[prev]
-                bottom = df["low"].iloc[prev]
+                top, bottom = df["high"].iloc[prev], df["low"].iloc[prev]
                 if _zone_still_valid(df, "demand", top, bottom, i):
                     zones.append({"type": "demand", "top": top,
                                   "bottom": bottom, "index": prev})
         elif df["close"].iloc[i] < df["open"].iloc[i]:
             if df["close"].iloc[prev] > df["open"].iloc[prev]:
-                top    = df["high"].iloc[prev]
-                bottom = df["low"].iloc[prev]
+                top, bottom = df["high"].iloc[prev], df["low"].iloc[prev]
                 if _zone_still_valid(df, "supply", top, bottom, i):
                     zones.append({"type": "supply", "top": top,
                                   "bottom": bottom, "index": prev})
@@ -347,10 +353,9 @@ def find_supply_demand_zones(df, lookback=ZONE_LOOKBACK_BARS):
 def find_liquidity_pools(df, tolerance_pips=3.0,
                          swing_window=5, min_bars_apart=10, max_age_bars=90):
     pips = 0.0001 if df["close"].iloc[-1] < 10 else 0.01
-    tol  = tolerance_pips * pips
+    tol = tolerance_pips * pips
     n = len(df)
     cutoff = max(n - max_age_bars, 0)
-
     highs_idx, lows_idx = [], []
     for i in range(swing_window, n - swing_window):
         if i < cutoff:
@@ -361,7 +366,6 @@ def find_liquidity_pools(df, tolerance_pips=3.0,
             highs_idx.append(i)
         if df["low"].iloc[i] == wl.min():
             lows_idx.append(i)
-
     pools = []
     for idx_list, kind in ((highs_idx, "equal_highs"), (lows_idx, "equal_lows")):
         for a in range(len(idx_list)):
@@ -395,13 +399,11 @@ def find_support_resistance(df, window=10):
     return sr
 
 # ============================================================
-# RETEST LOGIC
+# RETEST
 # ============================================================
 def touched_demand(zone, last_low, last_close, buffer_pips, pip):
-    zlow  = zone["bottom"]
-    zhigh = zone["top"]
-    buf   = buffer_pips * pip
-
+    zlow, zhigh = zone["bottom"], zone["top"]
+    buf = buffer_pips * pip
     if last_close < zlow:
         return False
     if zlow <= last_low <= zhigh:
@@ -415,10 +417,8 @@ def touched_demand(zone, last_low, last_close, buffer_pips, pip):
     return False
 
 def touched_supply(zone, last_high, last_close, buffer_pips, pip):
-    zlow  = zone["bottom"]
-    zhigh = zone["top"]
-    buf   = buffer_pips * pip
-
+    zlow, zhigh = zone["bottom"], zone["top"]
+    buf = buffer_pips * pip
     if last_close > zhigh:
         return False
     if zlow <= last_high <= zhigh:
@@ -447,10 +447,10 @@ def generate_signal(df, symbol):
 
     zones = find_supply_demand_zones(df)
     pools = find_liquidity_pools(df)
-    sr    = find_support_resistance(df)
+    sr = find_support_resistance(df)
 
     diag["zones"] = len(zones)
-    diag["sr"]    = len(sr)
+    diag["sr"] = len(sr)
     diag["pools"] = len(pools)
 
     if not zones:
@@ -458,8 +458,8 @@ def generate_signal(df, symbol):
         return None, diag
 
     last_close = df["close"].iloc[-1]
-    last_low   = df["low"].iloc[-1]
-    last_high  = df["high"].iloc[-1]
+    last_low = df["low"].iloc[-1]
+    last_high = df["high"].iloc[-1]
     pip = 0.0001 if last_close < 10 else 0.01
     spread = SPREAD_BUFFER_PIPS * pip
     signal_date = pd.Timestamp(df.index[-1]).date().isoformat()
@@ -468,8 +468,7 @@ def generate_signal(df, symbol):
     for zone in zones:
         if zone["type"] != "demand":
             continue
-        if not touched_demand(zone, last_low, last_close,
-                              RETEST_BUFFER_PIPS, pip):
+        if not touched_demand(zone, last_low, last_close, RETEST_BUFFER_PIPS, pip):
             diag["reasons"].append("long_no_retest")
             continue
         if not any(abs(s["level"] - zone["bottom"]) <= SR_TOLERANCE_PIPS * pip
@@ -482,9 +481,9 @@ def generate_signal(df, symbol):
             diag["reasons"].append("long_liquidity_trap")
             continue
 
-        entry     = last_close
+        entry = last_close
         zone_dist = max(entry - zone["bottom"], 0.0)
-        raw_dist  = zone_dist + ATR_BUFFER_MULT * atr
+        raw_dist = zone_dist + ATR_BUFFER_MULT * atr
         stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
         if stop_dist > MAX_STOP_ATR_MULT * atr:
             diag["reasons"].append("long_stop_too_wide")
@@ -506,8 +505,7 @@ def generate_signal(df, symbol):
     for zone in zones:
         if zone["type"] != "supply":
             continue
-        if not touched_supply(zone, last_high, last_close,
-                              RETEST_BUFFER_PIPS, pip):
+        if not touched_supply(zone, last_high, last_close, RETEST_BUFFER_PIPS, pip):
             diag["reasons"].append("short_no_retest")
             continue
         if not any(abs(s["level"] - zone["top"]) <= SR_TOLERANCE_PIPS * pip
@@ -520,9 +518,9 @@ def generate_signal(df, symbol):
             diag["reasons"].append("short_liquidity_trap")
             continue
 
-        entry     = last_close
+        entry = last_close
         zone_dist = max(zone["top"] - entry, 0.0)
-        raw_dist  = zone_dist + ATR_BUFFER_MULT * atr
+        raw_dist = zone_dist + ATR_BUFFER_MULT * atr
         stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
         if stop_dist > MAX_STOP_ATR_MULT * atr:
             diag["reasons"].append("short_stop_too_wide")
@@ -558,11 +556,11 @@ def calculate_lot_size(stop_pips):
             return 0.0, min_risk, "min_lot_exceeds_max_risk"
         lots = BROKER_MIN_LOT
         risk = min_risk
-        src  = "min_lot_floor"
+        src = "min_lot_floor"
     else:
         lots = round(lots, 2)
         risk = lots * stop_pips * PIP_VALUE_STANDARD
-        src  = "target"
+        src = "target"
     if (risk / ACCOUNT_BALANCE) * 100 > MAX_RISK_PERCENT:
         return 0.0, risk, "rounded_exceeds_max_risk"
     return lots, risk, src
@@ -570,23 +568,23 @@ def calculate_lot_size(stop_pips):
 # ============================================================
 # OUTCOME TRACKING
 # ============================================================
-def update_open_signals() -> int:
+def update_open_signals():
     conn = db_connect()
     try:
-        rows = conn.execute("""
-            SELECT id, symbol, direction, stop_loss, take_profit,
-                   risk_cents, signal_date, created_at
-            FROM signals WHERE outcome = 'open'
-        """).fetchall()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, symbol, direction, stop_loss, take_profit,
+                       risk_cents, signal_date, created_at
+                FROM signals WHERE outcome = 'open'
+            """)
+            rows = cur.fetchall()
     finally:
         conn.close()
 
     if not rows:
         return 0
 
-    cache = {}
-    updates = []
-
+    cache, updates = {}, []
     for r in rows:
         sym = r["symbol"]
         if sym not in cache:
@@ -607,14 +605,12 @@ def update_open_signals() -> int:
             bar_date = pd.Timestamp(ts).date()
             if bar_date <= start_date:
                 continue
-
             if is_long:
                 hit_sl = bar["low"] <= sl
                 hit_tp = bar["high"] >= tp
             else:
                 hit_sl = bar["high"] >= sl
                 hit_tp = bar["low"] <= tp
-
             if hit_sl:
                 updates.append((r["id"], "loss", sl, bar_date.isoformat(),
                                 -r["risk_cents"]))
@@ -629,19 +625,20 @@ def update_open_signals() -> int:
 
     conn = db_connect()
     try:
-        for sid, outcome, exit_price, closed_at, pnl in updates:
-            conn.execute("""
-                UPDATE signals
-                SET outcome = ?, exit_price = ?, closed_at = ?, pnl_cents = ?
-                WHERE id = ?
-            """, (outcome, exit_price, closed_at, pnl, sid))
+        with conn.cursor() as cur:
+            for sid, outcome, exit_price, closed_at, pnl in updates:
+                cur.execute("""
+                    UPDATE signals
+                    SET outcome=%s, exit_price=%s, closed_at=%s, pnl_cents=%s
+                    WHERE id=%s
+                """, (outcome, exit_price, closed_at, pnl, sid))
         conn.commit()
     finally:
         conn.close()
     return len(updates)
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM NOTIFICATION
 # ============================================================
 async def send_telegram(signal, lot_size, risk_cents, source):
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -653,7 +650,8 @@ async def send_telegram(signal, lot_size, risk_cents, source):
         f"Stop Loss: `{signal['stop']}`\n"
         f"Take Profit: `{signal['target']}`\n"
         f"Risk: {signal['risk_pips']} pips (1:3 RR)\n"
-        f"ATR({ATR_PERIOD}): {signal['atr_pips']} pips | Stop = {signal['atr_multiple']}× ATR\n"
+        f"ATR({ATR_PERIOD}): {signal['atr_pips']} pips | "
+        f"Stop = {signal['atr_multiple']}× ATR\n"
         f"Lot Size: `{lot_size}` ({source})\n"
         f"Risk ≈ {risk_cents:.1f}¢ ({risk_pct:.1f}%)\n"
         f"Zone: {signal['zone']['type'].capitalize()} "
@@ -664,9 +662,9 @@ async def send_telegram(signal, lot_size, risk_cents, source):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
 
 # ============================================================
-# MAIN
+# SCAN
 # ============================================================
-def main():
+def run_scan():
     db_init()
 
     try:
@@ -678,19 +676,16 @@ def main():
 
     started_at = datetime.now(timezone.utc).isoformat()
     run_id = db_insert_run_start(started_at)
-
     print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | "
           f"TargetRisk={RISK_PERCENT}% | MaxRisk={MAX_RISK_PERCENT}% | "
-          f"PipValue={PIP_VALUE_STANDARD} | DB={DB_PATH.name} | run_id={run_id}")
+          f"run_id={run_id}")
     print(f"[CFG]   ZONE_BODY_MULT={ZONE_BODY_MULT} | "
           f"RETEST_BUFFER_PIPS={RETEST_BUFFER_PIPS} | "
           f"SR_TOLERANCE_PIPS={SR_TOLERANCE_PIPS} | "
           f"FRESH_ZONES_ONLY={FRESH_ZONES_ONLY}")
 
-    pairs_scanned = 0
-    signals_sent = 0
-    signals_skipped = 0
-    errors = 0
+    pairs_scanned = signals_sent = signals_skipped = errors = 0
+    per_pair = []
 
     for pair in PAIRS:
         try:
@@ -700,11 +695,14 @@ def main():
                 db_insert_diagnostic(run_id, pair,
                                      {"zones": 0, "sr": 0, "pools": 0,
                                       "reasons": ["no_data"]})
+                per_pair.append((pair, None, {"reasons": ["no_data"],
+                                              "zones": 0, "sr": 0, "pools": 0}))
                 continue
 
             pairs_scanned += 1
             signal, diag = generate_signal(df, pair)
             db_insert_diagnostic(run_id, pair, diag)
+            per_pair.append((pair, signal, diag))
 
             if signal is None:
                 reasons = ",".join(diag["reasons"]) or "unknown"
@@ -713,11 +711,10 @@ def main():
                 continue
 
             if db_has_open_signal(signal["symbol"], signal["direction"]):
-                print(f"[OPEN] {pair} {signal['direction']}: signal already open, skipping")
+                print(f"[OPEN] {pair} {signal['direction']}: already open, skipping")
                 continue
 
             lots, risk_cents, source = calculate_lot_size(signal["risk_pips"])
-
             if lots == 0.0:
                 signals_skipped += 1
                 print(f"[SKIP] {pair} {signal['direction']}: {source} "
@@ -726,24 +723,48 @@ def main():
 
             inserted = db_insert_signal(signal, lots, risk_cents, source)
             if not inserted:
-                print(f"[DUP] {pair} {signal['direction']}: already sent for "
-                      f"candle {signal['signal_date']}, skipping Telegram")
+                print(f"[DUP] {pair} {signal['direction']}: already sent")
                 continue
 
             print(f"[SIGNAL] {pair} {signal['direction']} | lots={lots} | "
-                  f"risk={risk_cents:.1f}¢ ({(risk_cents/ACCOUNT_BALANCE)*100:.1f}%) | "
-                  f"source={source} | zones={diag['zones']} sr={diag['sr']} pools={diag['pools']}")
-
+                  f"risk={risk_cents:.1f}¢ | source={source}")
             asyncio.run(send_telegram(signal, lots, risk_cents, source))
             signals_sent += 1
 
         except Exception as e:
             errors += 1
             print(f"[ERROR] {pair}: {type(e).__name__}: {e}")
+            per_pair.append((pair, None,
+                             {"reasons": [f"error {type(e).__name__}"],
+                              "zones": 0, "sr": 0, "pools": 0}))
 
     db_finish_run(run_id, pairs_scanned, signals_sent, signals_skipped, errors)
     print(f"[DONE] {signals_sent} signal(s) sent | "
           f"{signals_skipped} skipped | {errors} errors | run_id={run_id}")
 
+    return {
+        "run_id": run_id,
+        "pairs_scanned": pairs_scanned,
+        "signals_sent": signals_sent,
+        "signals_skipped": signals_skipped,
+        "errors": errors,
+        "per_pair": [
+            {
+                "pair": p.replace("=X", ""),
+                "signal": (
+                    {"direction": s["direction"], "entry": s["entry"],
+                     "stop": s["stop"], "target": s["target"]}
+                    if s else None
+                ),
+                "reasons": d.get("reasons", []),
+                "zones": d.get("zones", 0),
+            }
+            for p, s, d in per_pair
+        ],
+    }
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 if __name__ == "__main__":
-    main()
+    run_scan()

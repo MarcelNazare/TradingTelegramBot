@@ -2,13 +2,15 @@
 Telegram command handlers for the Forex Signal Bot.
 Separate module so main.py stays focused on signal generation.
 
+Postgres (Neon) edition — uses psycopg2 instead of sqlite3.
 Every dynamic value that lands in a Markdown message is passed through
 _md_safe() first. If Telegram still rejects the message, _send_with_fallback()
 retries it as plain text — so no command can crash on a parse error.
 """
 
 import os
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,8 +22,6 @@ from telegram.ext import (
 )
 
 import main as bot_main
-
-DB_PATH = Path(__file__).parent / "signals.db"
 
 
 # ============================================================
@@ -50,10 +50,36 @@ async def _send_with_fallback(update: Update, text: str,
 # ============================================================
 # DATABASE HELPERS
 # ============================================================
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
+def _connect():
+    """Open a Postgres connection (autocommit for read-only queries)."""
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL not set")
+    conn = psycopg2.connect(url)
+    conn.autocommit = True
     return conn
+
+
+def _fetchone(query, params=()):
+    """Run a query and return the first row as a dict, or None."""
+    conn = _connect()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def _fetchall(query, params=()):
+    """Run a query and return all rows as dicts."""
+    conn = _connect()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, params)
+            return cur.fetchall()
+    finally:
+        conn.close()
 
 
 def _fmt_price(v):
@@ -73,7 +99,7 @@ def _now_utc() -> str:
 # ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 *Welcome to the Masheroooo Forex Signal Bot*\n"
+        "👋 *Welcome to the Forex Signal Bot*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "This bot scans the major forex pairs every day after the "
         "New York close and sends you ATR-adaptive, 1:3 risk-reward "
@@ -122,20 +148,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        conn = _connect()
-        try:
-            last_run = conn.execute(
-                "SELECT started_at, signals_sent, errors "
-                "FROM runs ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            total_signals = conn.execute(
-                "SELECT COUNT(*) AS n FROM signals"
-            ).fetchone()["n"]
-            open_signals = conn.execute(
-                "SELECT COUNT(*) AS n FROM signals WHERE outcome = 'open'"
-            ).fetchone()["n"]
-        finally:
-            conn.close()
+        last_run = _fetchone(
+            "SELECT started_at, signals_sent, errors "
+            "FROM runs ORDER BY id DESC LIMIT 1"
+        )
+        total_row = _fetchone("SELECT COUNT(*) AS n FROM signals")
+        open_row = _fetchone(
+            "SELECT COUNT(*) AS n FROM signals WHERE outcome = 'open'"
+        )
+        total_signals = total_row["n"] if total_row else 0
+        open_signals = open_row["n"] if open_row else 0
 
         if last_run:
             started = last_run["started_at"][:16].replace("T", " ")
@@ -169,15 +191,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        conn = _connect()
-        try:
-            rows = conn.execute(
-                "SELECT created_at, symbol, direction, entry, stop_loss, "
-                "take_profit, lot_size, outcome "
-                "FROM signals ORDER BY id DESC LIMIT 5"
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = _fetchall(
+            "SELECT created_at, symbol, direction, entry, stop_loss, "
+            "take_profit, lot_size, outcome "
+            "FROM signals ORDER BY id DESC LIMIT 5"
+        )
 
         if not rows:
             await _send_with_fallback(
@@ -219,13 +237,7 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        conn = _connect()
-        try:
-            r = conn.execute(
-                "SELECT * FROM signals ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        finally:
-            conn.close()
+        r = _fetchone("SELECT * FROM signals ORDER BY id DESC LIMIT 1")
 
         if not r:
             await _send_with_fallback(
@@ -378,7 +390,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"TP `{sig['target']}`"
                 )
                 if lots == 0.0:
-                    # No italic wrapper — source may contain underscores
                     lines.append(f"  ⚠️ Position too large: {safe_source}")
                 else:
                     lines.append(f"  Lots `{lots}` · risk `{risk_c:.1f}¢`")
@@ -407,26 +418,20 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        conn = _connect()
-        try:
-            last_run_id = conn.execute(
-                "SELECT id FROM runs ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            if not last_run_id:
-                await _send_with_fallback(
-                    update,
-                    "📭 *No runs yet*\n\nRun `/scan` to perform a scan.",
-                )
-                return
-            run_id = last_run_id["id"]
+        last_run = _fetchone("SELECT id FROM runs ORDER BY id DESC LIMIT 1")
+        if not last_run:
+            await _send_with_fallback(
+                update,
+                "📭 *No runs yet*\n\nRun `/scan` to perform a scan.",
+            )
+            return
+        run_id = last_run["id"]
 
-            rows = conn.execute(
-                "SELECT symbol, zones, sr_levels, pools, reasons "
-                "FROM pair_diagnostics WHERE run_id = ? ORDER BY symbol",
-                (run_id,),
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = _fetchall(
+            "SELECT symbol, zones, sr_levels, pools, reasons "
+            "FROM pair_diagnostics WHERE run_id = %s ORDER BY symbol",
+            (run_id,),
+        )
 
         if not rows:
             await _send_with_fallback(
@@ -460,46 +465,43 @@ async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        conn = _connect()
-        try:
-            totals = conn.execute("""
-                SELECT
-                  COUNT(*)                                        AS total,
-                  SUM(outcome = 'open')                           AS open_n,
-                  SUM(outcome = 'win')                            AS wins,
-                  SUM(outcome = 'loss')                           AS losses,
-                  SUM(outcome = 'breakeven')                      AS be,
-                  COALESCE(SUM(pnl_cents), 0)                     AS pnl
-                FROM signals
-            """).fetchone()
+        totals = _fetchone("""
+            SELECT
+              COUNT(*)                                        AS total,
+              SUM(CASE WHEN outcome = 'open'  THEN 1 ELSE 0 END) AS open_n,
+              SUM(CASE WHEN outcome = 'win'   THEN 1 ELSE 0 END) AS wins,
+              SUM(CASE WHEN outcome = 'loss'  THEN 1 ELSE 0 END) AS losses,
+              SUM(CASE WHEN outcome = 'breakeven' THEN 1 ELSE 0 END) AS be,
+              COALESCE(SUM(pnl_cents), 0)                     AS pnl
+            FROM signals
+        """)
 
-            if totals["total"] == 0:
-                await _send_with_fallback(
-                    update,
-                    "📭 *No signals yet*\n\nRun `/scan` to generate signals.",
-                )
-                return
-
-            closed = (totals["wins"] or 0) + (totals["losses"] or 0)
-            win_rate = (
-                (totals["wins"] or 0) / closed * 100 if closed else 0.0
+        if not totals or totals["total"] == 0:
+            await _send_with_fallback(
+                update,
+                "📭 *No signals yet*\n\nRun `/scan` to generate signals.",
             )
-            avg_pnl = (totals["pnl"] / closed) if closed else 0.0
-            pnl_c = totals["pnl"] or 0
+            return
 
-            per_pair = conn.execute("""
-                SELECT symbol,
-                       COUNT(*)                          AS total,
-                       SUM(outcome = 'win')              AS wins,
-                       SUM(outcome = 'loss')             AS losses
-                FROM signals
-                WHERE outcome IN ('win', 'loss')
-                GROUP BY symbol
-                ORDER BY wins DESC
-                LIMIT 8
-            """).fetchall()
-        finally:
-            conn.close()
+        wins = totals["wins"] or 0
+        losses = totals["losses"] or 0
+        be = totals["be"] or 0
+        closed = wins + losses
+        win_rate = (wins / closed * 100) if closed else 0.0
+        avg_pnl = (totals["pnl"] / closed) if closed else 0.0
+        pnl_c = totals["pnl"] or 0
+
+        per_pair = _fetchall("""
+            SELECT symbol,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN outcome = 'win'  THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses
+            FROM signals
+            WHERE outcome IN ('win', 'loss')
+            GROUP BY symbol
+            ORDER BY wins DESC
+            LIMIT 8
+        """)
 
         lines = [
             "📈 *Performance*",
@@ -508,8 +510,8 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Total signals: `{totals['total']}`",
             f"Open: `{totals['open_n'] or 0}`",
             f"Closed: `{closed}` "
-            f"(✅ {totals['wins'] or 0} · ❌ {totals['losses'] or 0}"
-            + (f" · ➖ {totals['be']}" if totals['be'] else "") + ")",
+            f"(✅ {wins} · ❌ {losses}"
+            + (f" · ➖ {be}" if be else "") + ")",
             "",
             f"Win rate: `{win_rate:.1f}%`",
             f"Total PnL: `{_fmt_cents(pnl_c)}`",
@@ -520,10 +522,10 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("")
             lines.append("*Per pair*")
             for p in per_pair:
-                closed_p = (p["wins"] or 0) + (p["losses"] or 0)
-                wr = (
-                    (p["wins"] or 0) / closed_p * 100 if closed_p else 0.0
-                )
+                w = p["wins"] or 0
+                l = p["losses"] or 0
+                closed_p = w + l
+                wr = (w / closed_p * 100) if closed_p else 0.0
                 lines.append(
                     f"`{p['symbol']:<7}` {closed_p:>2} trades · {wr:>5.1f}% WR"
                 )
@@ -586,7 +588,7 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Data*: Yahoo Finance daily candles\n"
         "*Timeframe*: Daily (multi-hour to multi-day holds)\n"
         "*Pairs*: 7 majors + 4 crosses\n"
-        "*Storage*: SQLite (`signals.db`)\n\n"
+        "*Storage*: Neon Postgres (`signals`, `runs`, `pair_diagnostics`)\n\n"
         "⚠️ *Important*\n"
         "This bot *sends signals only*. It does not connect to "
         "your broker and does not place trades. All risk is yours.\n\n"
