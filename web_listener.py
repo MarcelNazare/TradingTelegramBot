@@ -1,11 +1,10 @@
 """
 Render deployment: Telegram webhook listener + scan trigger endpoint.
 
-Two responsibilities:
-  1. Receive Telegram updates at /webhook/<TOKEN> and dispatch them
-     to the command handlers from telegram_commands.py
-  2. Expose /run-scan for an external cron service (cron-job.org)
-     to trigger the daily scan
+This version uses a dedicated background event loop for the Telegram
+Application. This is strictly required for python-telegram-bot v20+ to
+work alongside Flask, and ensures that asyncio.to_thread (used in the
+database commands) does not block or crash.
 
 Endpoints:
     POST /webhook/<TELEGRAM_TOKEN>   -> Telegram updates
@@ -18,12 +17,12 @@ Requires env vars:
     DATABASE_URL  (Neon Postgres connection string)
     SCAN_SECRET   (any random string; protects /run-scan)
     WEBHOOK_URL   (optional; e.g. https://your-bot.onrender.com)
-                  If set, the app registers the webhook with Telegram on start.
 """
 
 import os
 import sys
 import asyncio
+import threading
 import traceback
 from pathlib import Path
 
@@ -58,9 +57,65 @@ WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "").rstrip("/")
 # ============================================================
 # TELEGRAM APPLICATION
 # ============================================================
-# Build the application once. In webhook mode, this is not polling —
-# we hand Telegram a URL and it POSTs updates to us.
 telegram_app = build_application()
+
+# ============================================================
+# BACKGROUND EVENT LOOP (The Fallback)
+# ============================================================
+# Flask runs synchronously. PTB requires an active asyncio loop.
+# We create a loop, run it forever in a daemon thread, and route all
+# Telegram async work through it.
+
+_loop = asyncio.new_event_loop()
+
+def _run_background_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+_loop_thread = threading.Thread(
+    target=_run_background_loop,
+    args=(_loop,),
+    daemon=True,
+    name="TelegramAsyncLoop"
+)
+_loop_thread.start()
+
+# Initialize the Telegram app inside the background loop
+async def _init_telegram_app():
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+# Block until the app is fully initialized
+asyncio.run_coroutine_threadsafe(_init_telegram_app(), _loop).result(timeout=15)
+print("[BOOT] Telegram application initialized in background loop.")
+
+# ============================================================
+# WEBHOOK REGISTRATION
+# ============================================================
+def _register_webhook():
+    if not WEBHOOK_URL:
+        print("[WEBHOOK] WEBHOOK_URL not set — skipping registration.")
+        print("[WEBHOOK] Set WEBHOOK_URL=https://tradingtelegrambot.onrender.com/ to enable.")
+        return
+
+    full_url = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
+
+    async def _set():
+        await telegram_app.bot.set_webhook(
+            url=full_url,
+            allowed_updates=None,
+            drop_pending_updates=True,
+        )
+
+    try:
+        # Run the set_webhook coroutine on our background loop
+        future = asyncio.run_coroutine_threadsafe(_set(), _loop)
+        future.result(timeout=10)  # Wait up to 10s
+        print(f"[WEBHOOK] Registered: {full_url}")
+    except Exception as e:
+        print(f"[WEBHOOK] Registration failed: {type(e).__name__}: {e}")
+
+_register_webhook()
 
 # ============================================================
 # FLASK APP
@@ -68,47 +123,47 @@ telegram_app = build_application()
 app = Flask(__name__)
 
 
-# ---------- Health ----------
 @app.route("/health")
 def health():
     return "ok", 200
 
 
-# ---------- Webhook receiver ----------
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     """
     Telegram POSTs updates here. We feed them to the dispatcher queue
-    and let python-telegram-bot process them asynchronously.
+    on the background loop.
     """
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, telegram_app.bot)
 
-        # The update_queue is created lazily by PTB when the app starts.
-        # Put the update on the queue for the dispatcher to process.
         if telegram_app.update_queue is not None:
-            # In webhook mode, we need to run the coroutine to put the update
-            asyncio.get_event_loop().run_until_complete(
-                telegram_app.update_queue.put(update)
+            # Put update on the queue. The background loop handles processing.
+            future = asyncio.run_coroutine_threadsafe(
+                telegram_app.update_queue.put(update),
+                _loop
             )
+            future.result(timeout=5)
         else:
-            # Fallback: process synchronously (rarely needed)
-            asyncio.get_event_loop().run_until_complete(
-                telegram_app.process_update(update)
+            # Fallback: process update directly on the loop
+            future = asyncio.run_coroutine_threadsafe(
+                telegram_app.process_update(update),
+                _loop
             )
+            future.result(timeout=20)  # Some commands (like /scan) take time
+
         return "ok", 200
     except Exception as e:
+        print(f"[WEBHOOK ERROR] {type(e).__name__}: {e}")
         traceback.print_exc()
-        return f"error: {e}", 500
+        return "error", 500
 
 
-# ---------- Scan trigger ----------
 @app.route("/run-scan", methods=["GET"])
 def run_scan():
     """
-    Triggered by cron-job.org (or any external scheduler) once per day.
-    Protected by ?k=<SCAN_SECRET>.
+    Triggered by cron-job.org. Protected by ?k=<SCAN_SECRET>.
     """
     if SCAN_SECRET and request.args.get("k") != SCAN_SECRET:
         abort(403)
@@ -122,44 +177,10 @@ def run_scan():
 
 
 # ============================================================
-# WEBHOOK REGISTRATION (run once at startup if WEBHOOK_URL is set)
-# ============================================================
-def _register_webhook():
-    """
-    If WEBHOOK_URL is set, tell Telegram to send updates to our endpoint.
-    This replaces polling — Telegram pushes each update to us instead of
-    us asking Telegram for new messages.
-    """
-    if not WEBHOOK_URL:
-        print("[WEBHOOK] WEBHOOK_URL not set — skipping registration.")
-        print("[WEBHOOK] Set WEBHOOK_URL=https://your-bot.onrender.com to enable.")
-        print("[WEBHOOK] Until then, commands will NOT be received.")
-        return
-
-    full_url = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
-
-    async def _set():
-        await telegram_app.bot.set_webhook(
-            url=full_url,
-            allowed_updates=None,
-            drop_pending_updates=True,
-        )
-
-    try:
-        asyncio.get_event_loop().run_until_complete(_set())
-        print(f"[WEBHOOK] Registered: {full_url}")
-    except Exception as e:
-        print(f"[WEBHOOK] Registration failed: {type(e).__name__}: {e}")
-
-
-# Register on import — Render runs this file as a WSGI/ASGI entrypoint
-_register_webhook()
-
-
-# ============================================================
 # ENTRYPOINT
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print(f"[BOOT] Listening on 0.0.0.0:{port}")
+    print(f"[BOOT] Flask listening on 0.0.0.0:{port}")
+    # threaded=True is crucial so webhook and health requests don't block each other
     app.run(host="0.0.0.0", port=port, threaded=True)
