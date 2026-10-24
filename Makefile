@@ -1,5 +1,5 @@
 # ============================================================
-# Forex Signal Bot — Makefile
+# Forex Signal Bot — Makefile -
 # ============================================================
 
 # Auto-detect Python and venv paths
