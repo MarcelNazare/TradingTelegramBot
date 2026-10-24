@@ -1,7 +1,5 @@
-I've updated the README to include the live Telegram bot link (`t.me/masheroooo_forex_signal_bot`) in the header, the quick-start section, and the deployment verification steps. The rest of the document remains identical, covering the full stack (Neon, Render, cron-job.org).
 
-```markdown
-# Forex Signal Bot
+# Masheroooo Forex Signal Bot
 
 **Try the live bot:** [@masheroooo_forex_signal_bot](https://t.me/masheroooo_forex_signal_bot)
 
@@ -492,4 +490,3 @@ forex-signal-bot/
 - Never risk more than you can afford to lose entirely.
 
 **By running this bot, you accept full responsibility for every trade you place based on its output.**
-```
