@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forex Bot Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
+        h1, h2 { color: #38bdf8; }
+        .stats-container { display: flex; gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: #1e293b; padding: 20px; border-radius: 8px; flex: 1; border: 1px solid #334155; }
+        .stat-card h3 { margin: 0 0 10px 0; font-size: 14px; color: #94a3b8; text-transform: uppercase; }
+        .stat-card .value { font-size: 28px; font-weight: bold; }
+        .win { color: #4ade80; }
+        .loss { color: #f87171; }
+        .open { color: #fbbf24; }
+        table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; margin-bottom: 30px; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #334155; }
+        th { background: #0f172a; color: #94a3b8; font-weight: 600; font-size: 13px; text-transform: uppercase; }
+        tr:hover { background: #334155; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+        .bg-win { background: #166534; color: #4ade80; }
+        .bg-loss { background: #7f1d1d; color: #f87171; }
+        .bg-open { background: #78350f; color: #fbbf24; }
+        .long { color: #4ade80; }
+        .short { color: #f87171; }
+    </style>
+</head>
+<body>
+    <h1>Forex Signal Bot Dashboard</h1>
+    
+    <div class="stats-container">
+        <div class="stat-card">
+            <h3>Total Signals</h3>
+            <div class="value">{{ stats.total }}</div>
+        </div>
+        <div class="stat-card">
+            <h3>Win Rate</h3>
+            <div class="value win">{{ stats.win_rate }}%</div>
+        </div>
+        <div class="stat-card">
+            <h3>Total PnL</h3>
+            <div class="value {{ 'win' if stats.pnl >= 0 else 'loss' }}">{{ stats.pnl }}¢</div>
+        </div>
+        <div class="stat-card">
+            <h3>Open Signals</h3>
+            <div class="value open">{{ stats.open }}</div>
+        </div>
+    </div>
+
+    <h2>Recent Signals</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Pair</th>
+                <th>Direction</th>
+                <th>Entry</th>
+                <th>Stop</th>
+                <th>Target</th>
+                <th>Lots</th>
+                <th>Outcome</th>
+                <th>PnL</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in signals %}
+            <tr>
+                <td>{{ s.created_at[:16].replace('T', ' ') }}</td>
+                <td><strong>{{ s.symbol }}</strong></td>
+                <td class="{{ 'long' if s.direction == 'LONG' else 'short' }}">{{ s.direction }}</td>
+                <td>{{ "%.5f"|format(s.entry) }}</td>
+                <td>{{ "%.5f"|format(s.stop_loss) }}</td>
+                <td>{{ "%.5f"|format(s.take_profit) }}</td>
+                <td>{{ s.lot_size }}</td>
+                <td>
+                    <span class="badge bg-{{ s.outcome }}">
+                        {{ s.outcome.upper() }}
+                    </span>
+                </td>
+                <td class="{{ 'win' if s.pnl_cents and s.pnl_cents > 0 else 'loss' if s.pnl_cents and s.pnl_cents < 0 else '' }}">
+                    {% if s.pnl_cents is not none %}{{ "%.1f"|format(s.pnl_cents) }}¢{% else %}—{% endif %}
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="9" style="text-align: center;">No signals found.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
