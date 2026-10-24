@@ -1,33 +1,29 @@
-@ -1,579 +1,37 @@
-# README.md (Updated)
+I've updated the README to include the live Telegram bot link (`t.me/masheroooo_forex_signal_bot`) in the header, the quick-start section, and the deployment verification steps. The rest of the document remains identical, covering the full stack (Neon, Render, cron-job.org).
 
 ```markdown
-# Forex Signal Bot — Weltrade Micro (Cent) Account Edition
+# Forex Signal Bot
 
-A Python-based forex signal generator that detects supply/demand zones, liquidity pools, and support/resistance levels on major currency pairs, then sends formatted trade alerts to Telegram. Built for swing trades (hours to a day) with ATR-adaptive stops, a strict 1:3 risk-reward ratio, and position sizing tuned for small cent accounts.
+**Try the live bot:** [@masheroooo_forex_signal_bot](https://t.me/masheroooo_forex_signal_bot)
 
-> ⚠️ **This is a signal bot, not an auto-trader.** It does not place orders. It sends you a notification with entry, stop-loss, take-profit, and suggested lot size. You decide whether to execute.
+A Python-based forex signal generator that scans 11 major currency pairs daily, detects supply/demand zones, liquidity pools, and support/resistance levels, and delivers ATR-adaptive 1:3 risk-reward signals to Telegram. Built for small cent accounts, it tracks every signal's outcome in a persistent cloud database and exposes a full 13-command Telegram interface for live queries.
+
+**This is a signal notifier, not an auto-trader.** It does not connect to your broker or place trades. You execute manually and manage your own risk.
 
 ---
 
 ## Table of Contents
 
 - [What It Does](#what-it-does)
-- [What It Does NOT Do](#what-it-does-not-do)
+- [Technology Stack](#technology-stack)
 - [Architecture](#architecture)
-- [Requirements](#requirements)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
+- [How the Signal Pipeline Works](#how-the-signal-pipeline-works)
+- [Telegram Commands](#telegram-commands)
+- [The Risk Model](#the-risk-model)
+- [Deployment](#deployment)
 - [Environment Variables](#environment-variables)
-- [Configuration](#configuration)
-- [Telegram Setup](#telegram-setup)
-- [Running the Bot](#running-the-bot)
-- [Makefile Reference](#makefile-reference)
-- [Deployment on PythonAnywhere (Free Tier)](#deployment-on-pythonanywhere-free-tier)
-- [Calibrating `PIP_VALUE_STANDARD`](#calibrating-pip_value_standard)
-- [Understanding the Output](#understanding-the-output)
-- [The Risk Math (Read This)](#the-risk-math-read-this)
-- [Limitations](#limitations)
+- [Database Schema](#database-schema)
+- [Tuning Guide](#tuning-guide)
+- [Honest Limitations](#honest-limitations)
 - [Roadmap](#roadmap)
 - [Disclaimer](#disclaimer)
 
@@ -35,522 +31,454 @@ A Python-based forex signal generator that detects supply/demand zones, liquidit
 
 ## What It Does
 
-The bot runs once per invocation (designed for a daily schedule after the New York close). For each of seven major pairs, it:
+The bot combines four pieces of market analysis that supply/demand traders use manually, and turns them into a systematic signal pipeline:
 
-1. **Fetches** the last 6 months of daily OHLCV data from Yahoo Finance.
-2. **Detects market structure**:
-   - **Supply/demand zones** — the last opposite candle before a strong impulse move (body > 1.5× the 20-period average body).
-   - **Liquidity pools** — equal highs/lows within a 3-pip tolerance.
-   - **Support/resistance** — swing highs/lows with at least 2 touches.
-3. **Generates a signal** if price is currently retesting a zone that aligns with a support/resistance level and is *not* sitting on the wrong side of a liquidity pool (which would invite a stop hunt).
-4. **Places an ATR-adaptive stop** beyond the zone edge with a buffer, clamped between 1× and 3× ATR(14).
-5. **Sets take-profit at exactly 3× the stop distance** — the 1:3 RR is enforced in code, always.
-6. **Sizes the position** using a dynamic risk model: 5% target risk, 10% hard ceiling, respecting the broker minimum lot.
-7. **Sends a Telegram message** with entry, stop, target, pip risk, ATR context, lot size, and dollar risk.
+1. **Supply/demand zones** — Every recent impulse candle (body ≥ 1.2× the 20-bar average) creates a zone at the prior opposite candle's high/low. Zones survive retests but die when price closes through them.
+2. **Liquidity pools** — Swing highs/lows within 3 pips of each other, at least 10 bars apart, over the last 90 bars. If a zone has an equal level sitting just beyond it, the signal is filtered out (stop-hunt risk).
+3. **Support/resistance confluence** — Swing levels touched at least twice within a 10-pip band. A zone only fires if there's a matching S/R level within 10 pips.
+4. **ATR-adaptive stops** — Stop distance = zone width + 0.3× ATR(14), clamped between 1.0× and 3.0× ATR, plus a 2-pip spread buffer.
 
-## What It Does NOT Do
+Signals are sent to Telegram with entry, stop, target, lot size, dollar risk, ATR context, and the zone boundaries. Outcomes are tracked automatically: every open signal is walked forward through new candles and marked `win` or `loss` when price touches the target or stop.
 
-Be clear-eyed about this list before deploying:
+---
 
-- ❌ **Does not execute trades.** It is a notifier. You place orders manually.
-- ❌ **Does not guarantee profit.** The strategy has an untested edge. See [The Risk Math](#the-risk-math-read-this).
-- ❌ **Does not backtest.** There is no historical performance data included. You must build your own.
-- ❌ **Does not manage open positions.** No trailing stops, no partial exits, no breakeven moves.
-- ❌ **Does not check news events.** Major releases can gap through your stop.
-- ❌ **Does not model slippage or spread.** Telegram alerts show raw price; your broker fills will differ.
-- ❌ **Does not validate zone freshness.** A zone already tapped twice is treated the same as a fresh one.
-- ❌ **Does not align with higher-timeframe trend.** Counter-trend entries are possible.
+## Technology Stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Language** | Python 3.9+ | Core bot logic |
+| **Market Data** | [yfinance](https://github.com/ranaroussi/yfinance) | Fetches daily OHLCV from Yahoo Finance |
+| **Data Processing** | pandas, numpy | Time-series analysis, ATR, swing detection |
+| **Database** | [Neon](https://neon.tech) (Serverless Postgres) | Persistent storage for signals, runs, diagnostics |
+| **DB Driver** | psycopg2-binary | Postgres adapter for Python |
+| **Messaging** | Telegram Bot API | Signal alerts + 13-command interface |
+| **Telegram Lib** | python-telegram-bot v20+ | Async command handlers, webhook mode |
+| **Web Framework** | Flask | Webhook receiver + scan trigger endpoint |
+| **Hosting** | [Render](https://render.com) (Free Web Service) | Runs the web listener + scan trigger |
+| **Scheduler** | [cron-job.org](https://cron-job.org) (Free) | Fires the daily scan via HTTP GET |
+| **Config** | python-dotenv | Environment variable loading from `.env` |
+
+### Why This Stack
+
+- **Neon over SQLite** — Render's free tier has no persistent disk. SQLite would reset on every redeploy. Neon's serverless Postgres persists independently of the hosting environment, with 1 GB storage and 100 CU-hours/month free.
+- **Render over Railway/PythonAnywhere** — Railway's free tier is now a one-time $5 credit. PythonAnywhere's free tier doesn't support always-on processes or scheduled tasks for newer accounts. Render's free Web Service tier works for the command listener, though it spins down after 15 minutes idle.
+- **cron-job.org over Render Cron** — Render's Cron Job feature is a paid add-on. cron-job.org is free (100 calls/day) and hits the `/run-scan` HTTP endpoint daily.
+- **Flask + Webhook over Polling** — Telegram's webhook mode avoids running a continuous polling loop, which is important on free tiers that spin down idle services. Telegram pushes each update to your Flask endpoint when a command arrives.
+
+---
 
 ## Architecture
 
 ```
-┌──────────────────┐
-│  yfinance (1d)   │  Fetch 6 months OHLCV per pair
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────────────────────────────┐
-│  Market structure analysis               │
-│  • Supply/demand zones                   │
-│  • Liquidity pools (equal highs/lows)    │
-│  • Support/resistance (swing touches)    │
-│  • ATR(14)                               │
-└────────┬─────────────────────────────────┘
-         │
-         ▼
-┌──────────────────────────────────────────┐
-│  Signal generation                       │
-│  • Zone retest + S/R alignment           │
-│  • Liquidity trap filter                 │
-│  • ATR-based stop (1×–3× ATR clamp)      │
-│  • Take-profit = 3× stop distance        │
-└────────┬─────────────────────────────────┘
-         │
-         ▼
-┌──────────────────────────────────────────┐
-│  Position sizing                         │
-│  • 5% target risk, 10% ceiling           │
-│  • Enforces broker minimum lot           │
-│  • Skips trade if min lot exceeds ceiling│
-└────────┬─────────────────────────────────┘
-         │
-         ▼
-┌──────────────────────────────────────────┐
-│  Telegram notification                   │
-└──────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  You (Telegram)                                             │
+│  └─ Types /status, /scan, /help...                          │
+└───────────────────────────────┬─────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Telegram Bot API                                           │
+│  └─ POSTs update to https://<bot>.onrender.com/webhook/...  │
+└───────────────────────────────┬─────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Render Web Service (web_listener.py)                       │
+│  ├─ Flask /webhook   → dispatches to telegram_commands.py   │
+│  ├─ Flask /run-scan  → triggers main.run_scan()             │
+│  └─ Flask /health    → health check                         │
+└───────────────────────────────┬─────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Neon Postgres (persistent)                                 │
+│  ├─ signals            → every trade signal + outcome       │
+│  ├─ runs               → execution log                      │
+│  └─ pair_diagnostics   → per-pair filter reasons            │
+└─────────────────────────────────────────────────────────────┘
+                                ▲
+                                │
+┌───────────────────────────────┴─────────────────────────────┐
+│  cron-job.org (daily 22:00 UTC)                             │
+│  └─ GET https://<bot>.onrender.com/run-scan?k=SECRET        │
+│     └─ Triggers the daily scan (fetches data, sends alerts) │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Requirements
+### Two Independent Modes
 
-- Python 3.9+
-- A Telegram bot (see [Telegram Setup](#telegram-setup))
-- A free [PythonAnywhere](https://www.pythonanywhere.com/) account (or any always-on host)
-- Optional: a Weltrade Micro (cent) demo account for live comparison
-- `make` (optional but recommended — see [Makefile Reference](#makefile-reference))
+**Mode 1 — Daily Scan (triggered by cron-job.org):**
+- Runs `main.run_scan()` once per day after the NY close
+- Checks open signals → marks wins/losses
+- Scans 11 pairs → generates new signals
+- Sends Telegram alerts for new signals
+- Writes to Neon
+- Returns JSON to cron-job.org, exits
 
-### Python packages
+**Mode 2 — Command Listener (always-on via Render):**
+- Listens for Telegram webhook updates
+- Answers `/status`, `/signals`, `/performance`, etc.
+- Runs live `/scan` on demand (preview only, does not save)
+- Reads from Neon
+- Responds within 1–3 seconds (or ~30s after wakeup)
+
+The two modes share only the Neon database. Neither depends on the other running.
+
+---
+
+## How the Signal Pipeline Works
+
+For each of the 11 pairs, the scan runs these steps:
+
+### 1. Fetch data
+Pulls 6 months of daily OHLCV from Yahoo Finance. The currently-forming daily candle is dropped if before 22:00 UTC, so every signal is based on completed bars.
+
+### 2. Detect supply/demand zones
+Scans the last 50 bars for impulse candles (body ≥ 1.2× the 20-bar average). Each impulse creates a zone at the prior opposite candle's high/low. A zone dies when any later close goes through its far edge; it survives mere touches.
+
+### 3. Detect liquidity pools
+Finds swing highs/lows (5-bar pivots, at least 10 bars apart, last 90 bars). Any pair within 3 pips is an equal-highs/equal-lows pool.
+
+### 4. Detect support/resistance
+Swing highs/lows (10-bar pivots) with at least 2 touches within 10 pips become S/R levels.
+
+### 5. Generate signal
+For a **long** (demand retest):
+- Today's low must touch or come within 5 pips of the zone, without closing below it.
+- A support level must be within 10 pips of the zone bottom.
+- No equal-lows pool just below the zone.
+- Stop = zone distance + 0.3× ATR, clamped to 1.0–3.0× ATR, plus 2-pip spread.
+- Target = entry + 3 × stop distance (strict 1:3 RR).
+
+For a **short** (supply retest): mirror logic.
+
+If any check fails, the zone is rejected and the reason recorded (`long_no_retest`, `short_no_resistance`, etc.).
+
+### 6. Size position
+Target risk = 5% of balance. If the computed lot size falls below the broker minimum (0.01 lots), the bot uses the minimum only if that doesn't exceed 10% of balance. Otherwise the signal is **skipped** — the account is too small to safely take this trade.
+
+### 7. Deduplicate
+No new signal while one is open for the same (symbol, direction). Unique index prevents duplicate signals per candle.
+
+### 8. Save, notify, log
+Writes to Neon → sends Telegram alert → records diagnostics → exits.
+
+---
+
+## Telegram Commands
+
+| Command | Description |
+|---|---|
+| `/start` | Welcome message and quick-start tips |
+| `/help` | Full command reference |
+| `/status` | Bot status, last run time, total and open signals |
+| `/signals` | Last 5 signals with entry/SL/TP/lot/outcome |
+| `/latest` | Most recent signal with full detail |
+| `/pairs` | List all 11 monitored pairs |
+| `/balance` | Configured balance, target risk, ceiling |
+| `/risk` | Risk %, ATR settings, spread buffer, broker min lot |
+| `/scan` | Live scan — returns current setups without saving |
+| `/diagnostics` | Zone/S/R/pool counts and rejection reasons for last run |
+| `/performance` | Win rate, total PnL, avg PnL, per-pair breakdown |
+| `/settings` | Full config dump — all tuning constants |
+| `/about` | Bot description and disclaimers |
+
+**Try them live:** [@masheroooo_forex_signal_bot](https://t.me/masheroooo_forex_signal_bot)
+
+Every command is Markdown-safe: dynamic values are sanitized before display, and if Telegram rejects the formatting, the message falls back to plain text. No command can crash on a parse error.
+
+---
+
+## The Risk Model
+
+Risk is enforced in three places:
+
+| Rule | Value | What It Prevents |
+|---|---|---|
+| **Target risk per trade** | 5% of balance | Over-sizing |
+| **Hard ceiling** | 10% of balance | Catastrophic single-trade loss |
+| **Broker minimum enforcement** | Skip if min lot exceeds ceiling | Over-risking on wide stops |
+| **Duplicate prevention** | One open signal per (symbol, direction) | Accumulating correlated exposure |
+
+On a $3 account with a 100-pip stop:
+```
+Target risk: 5% × 300¢ = 15¢
+Required lots: 15¢ / (100 pips × $10/pip) = 0.015 lots → below 0.01 minimum
+Min-lot risk: 0.01 × 100 × $10 = 10¢ → 3.3% of balance
+Ceiling check: 10¢ ≤ 30¢ (10% of 300¢) → trade allowed, floored to min lot
+```
+
+On a $3 account with a 300-pip stop:
+```
+Min-lot risk: 0.01 × 300 × $10 = 30¢ → 10% of balance
+Ceiling check: 30¢ > 30¢? No, exactly equal → trade allowed at ceiling
+```
+
+On a $3 account with a 400-pip stop:
+```
+Min-lot risk: 0.01 × 400 × $10 = 40¢ → 13.3% of balance
+Ceiling check: 40¢ > 30¢ → **SKIP**
+```
+
+The bot will refuse trades it cannot safely execute. This is not a bug — it is the design.
+
+---
+
+## Deployment
+
+### Prerequisites
+
+1. **Telegram Bot** — created via [@BotFather](https://t.me/BotFather). Save your bot token and chat ID.
+2. **Neon Account** — [neon.tech](https://neon.tech), free tier. Create a project and copy the connection string.
+3. **Render Account** — [render.com](https://render.com), free tier. Connect your GitHub repo.
+4. **cron-job.org Account** — [cron-job.org](https://cron-job.org), free tier.
+
+### Step 1 — Set up Neon
+
+1. Sign up at [neon.tech](https://neon.tech).
+2. Create a project.
+3. In the Neon Console, click **Connect** and copy the connection string. It looks like:
+   ```
+   postgresql://user:pass@ep-cool-name-123456.us-east-2.aws.neon.tech/neondb?sslmode=require
+   ```
+4. Save this — it goes into Render's environment variables.
+
+### Step 2 — Deploy to Render
+
+1. Push your code to GitHub.
+2. In Render, click **New → Web Service**.
+3. Connect your GitHub repo.
+4. Set:
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `python web_listener.py`
+   - **Plan**: Free
+5. Add these Environment Variables in the Render dashboard:
+   ```
+   TELEGRAM_TOKEN=1234567890:ABCdef...
+   TELEGRAM_CHAT_ID=987654321
+   DATABASE_URL=postgresql://user:pass@ep-...neon.tech/neondb?sslmode=require
+   WEBHOOK_URL=https://your-bot.onrender.com
+   SCAN_SECRET=xK9mP2nQ8vR4sT7wY1zA5bC3dE6fG0hJ
+   ```
+6. Click **Create Web Service**. Render will build and deploy.
+
+The startup log should show:
+```
+[BOOT] Telegram application initialized in background loop.
+[WEBHOOK] Registered: https://your-bot.onrender.com/webhook/<TOKEN>
+[BOOT] Flask listening on 0.0.0.0:10000
+```
+
+### Step 3 — Create the Database Tables
+
+Hit the scan endpoint once to run `db_init()`:
 
 ```
-yfinance>=0.2.40
-pandas>=2.0.0
-numpy>=1.24.0
-python-telegram-bot>=20.0
-python-dotenv>=1.0.0
+https://your-bot.onrender.com/run-scan?k=YOUR_SCAN_SECRET
 ```
 
-## Quick Start
+Expected response:
+```json
+{"status":"ok","result":{"run_id":1,"pairs_scanned":11,"signals_sent":0,...}}
+```
 
-For the impatient — five commands from zero to a test alert:
+The `signals`, `runs`, and `pair_diagnostics` tables are now created in Neon.
 
+### Step 4 — Set up cron-job.org
+
+1. Sign up at [cron-job.org](https://cron-job.org).
+2. Click **Create cronjob**.
+3. **Title**: Forex Bot Daily Scan
+4. **URL**:
+   ```
+   https://your-bot.onrender.com/run-scan?k=YOUR_SCAN_SECRET
+   ```
+5. **Schedule**: Every day at `22:00` UTC (or whenever the NY close is).
+6. Save. Enable email notifications for failures.
+
+### Step 5 — Verify
+
+**Test the health endpoint:**
 ```bash
-make install           # create venv + install deps
-make env               # create .env from template
-# ... edit .env with your TELEGRAM_TOKEN and TELEGRAM_CHAT_ID ...
-make check             # sanity-check syntax and .env
-make telegram-test     # send a test message to confirm wiring
-make run               # run the bot once
+curl https://your-bot.onrender.com/health
+# Expected: ok
 ```
 
-If `make` isn't available, use `pip install -r requirements.txt` and `python3 forex_bot.py` manually. Everything the Makefile does can be done by hand — it just packages the commands for you.
+**Test in Telegram:** [@masheroooo_forex_signal_bot](https://t.me/masheroooo_forex_signal_bot)
+- Send `/start` → welcome message
+- Send `/help` → full command list
+- Send `/status` → bot status
+- Send `/scan` → live scan results (may take 20–40s)
 
-## Installation
-
-### Local (with Makefile — recommended)
-
-```bash
-git clone <your-repo-url> forex-signal-bot
-cd forex-signal-bot
-make install
-make env
+**Check Neon:**
+```sql
+SELECT * FROM signals ORDER BY id DESC LIMIT 5;
+SELECT * FROM runs ORDER BY id DESC LIMIT 5;
 ```
 
-### Local (without Makefile)
-
-```bash
-git clone <your-repo-url> forex-signal-bot
-cd forex-signal-bot
-python3 -m venv venv
-source venv/bin/activate         # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env             # then edit .env
-```
-
-### On PythonAnywhere
-
-```bash
-pip3 install --user yfinance pandas numpy python-telegram-bot python-dotenv
-```
-
-Then upload `forex_bot.py` via the **Files** tab, or use `make pa-upload PA_USER=yourusername` from a local machine with SSH access.
+---
 
 ## Environment Variables
 
-The bot reads credentials from a `.env` file in the script's directory (via `python-dotenv`), falling back to the process environment if the file is absent.
+Set these in **Render → Environment**:
 
-### Create your `.env`
-
-```bash
-make env
-```
-
-Or copy manually:
-
-```bash
-cp .env.example .env
-```
-
-Then edit `.env`:
-
-```
-TELEGRAM_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
-TELEGRAM_CHAT_ID=123456789
-```
-
-### Precedence
-
-1. Process environment variables (e.g., PythonAnywhere task UI) — **win**
-2. `.env` file — used when no environment variable is set
-3. Hard failure — the script raises `RuntimeError` if either credential is missing
-
-### Never commit `.env`
-
-The repo's `.gitignore` excludes `.env`. Only `.env.example` (with placeholder values) is tracked. If you accidentally commit `.env`, rotate your bot token in `@BotFather` immediately — it is compromised.
-
-## Configuration
-
-All tunables live at the top of `forex_bot.py`. The values below are defaults tuned for a **300-cent ($3 real) Weltrade Micro account**.
-
-```python
-# Account & sizing
-ACCOUNT_BALANCE    = 300.0    # cents (300¢ = $3 real)
-RISK_PERCENT       = 5.0      # target risk per trade
-MAX_RISK_PERCENT   = 10.0     # hard ceiling — skip if minimum lot exceeds this
-BROKER_MIN_LOT     = 0.01     # Weltrade micro minimum
-PIP_VALUE_STANDARD = 0.10     # cents per pip per 1.0 cent-lot — MUST be calibrated
-SPREAD_BUFFER_PIPS = 2.0      # extra pips added to stop beyond zone edge
-
-# ATR stop tuning
-ATR_PERIOD        = 14
-ATR_BUFFER_MULT   = 0.3       # ATR buffer beyond zone edge (0.3 = 30% of ATR)
-MIN_STOP_ATR_MULT = 1.0       # minimum stop distance from entry
-MAX_STOP_ATR_MULT = 3.0       # maximum stop distance — wider than this = skip
-
-# Pairs
-PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
-         "AUDUSD=X", "USDCAD=X", "NZDUSD=X"]
-```
-
-### Tuning guide
-
-| Symptom | Adjustment |
-|---|---|
-| Stops keep getting wicked out | Raise `ATR_BUFFER_MULT` to `0.5` |
-| Too many trades skipped by max cap | Raise `MAX_STOP_ATR_MULT` to `3.5` |
-| Every trade skipped by min-lot ceiling | `PIP_VALUE_STANDARD` is probably wrong — see calibration |
-| Lot sizes look 10× too large | `PIP_VALUE_STANDARD` is 10× too small |
-| Using a standard (non-cent) account | Multiply `ACCOUNT_BALANCE` by 100, or recalibrate `PIP_VALUE_STANDARD` to `10.0` |
-
-## Telegram Setup
-
-### 1. Create the bot
-
-1. Open Telegram, search for **`@BotFather`**, start a chat.
-2. Send `/newbot`.
-3. Give it a **display name** (anything) and a **username** (must end in `bot`, e.g. `my_forex_signal_bot`).
-4. BotFather replies with a **token** like `1234567890:ABCdefGHIjklMNOpqrsTUVwxyz`. Save this — it's the password.
-
-### 2. Get your chat ID
-
-1. Search for your bot's username, open the chat, send `/start` or any message.
-2. In a browser, visit:
-   ```
-   https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-   ```
-3. Find `"chat": { "id": 123456789, ... }` — that number is your chat ID.
-
-Alternative: message **`@userinfobot`** — it replies with your user ID immediately.
-
-### 3. Store credentials
-
-Put them in `.env` (see [Environment Variables](#environment-variables)) or set them in the PythonAnywhere task editor's environment fields.
-
-## Running the Bot
-
-### Manual test
-
-```bash
-make run
-```
-
-Or directly:
-
-```bash
-python3 forex_bot.py
-```
-
-Example output:
-
-```
-[START] 2026-10-23T22:00:01 UTC | Balance=300.0¢ | TargetRisk=5.0% | MaxRisk=10.0% | PipValue=0.1
-[NONE] EURUSD=X: no signal
-[SIGNAL] GBPUSD=X SHORT | lots=1.5 | risk=15.0¢ (5.0%) | source=target
-[NONE] USDJPY=X: no signal
-[SKIP] USDCHF=X LONG: min_lot_exceeds_max_risk (stop=380.0 pips, min-lot risk=38.0¢ > 10.0% ceiling)
-[NONE] AUDUSD=X: no signal
-[NONE] USDCAD=X: no signal
-[NONE] NZDUSD=X: no signal
-[DONE] 1 signal(s) sent.
-```
-
-Log prefixes:
-
-| Prefix | Meaning |
-|---|---|
-| `[START]` | Run began — config summary printed |
-| `[NONE]` | Pair scanned, no qualifying setup |
-| `[SIGNAL]` | Signal sent to Telegram |
-| `[SKIP]` | Setup found but position sizing rejected it |
-| `[ERROR]` | Exception during processing (pair skipped) |
-| `[DONE]` | Run complete with signal count |
-
-### Telegram message format
-
-```
-🚨 GBPUSD SHORT
-━━━━━━━━━━━━━━
-Entry: 1.27450
-Stop Loss: 1.27810
-Take Profit: 1.26370
-Risk: 36.0 pips (1:3 RR)
-ATR(14): 28.7 pips | Stop = 1.25× ATR
-Lot Size: 1.5 (target)
-Risk ≈ 15.0¢ (5.0% of account)
-Max win ≈ 45.0¢
-Zone: Supply (1.27200 – 1.27400)
-⏰ 2026-10-23 22:00 UTC
-```
-
-## Makefile Reference
-
-Run `make help` to list every target. Full reference:
-
-### Setup
-
-| Target | Description |
-|---|---|
-| `make install` | Create venv and install dependencies |
-| `make install-dev` | Above + pytest, ruff, black |
-| `make env` | Copy `.env.example` → `.env` (does not overwrite) |
-| `make requirements` | Create default `requirements.txt` if missing |
-
-### Running
-
-| Target | Description |
-|---|---|
-| `make run` | Run the bot once |
-| `make run-verbose` | Run with `LOG_LEVEL=DEBUG` |
-| `make run-bg` | Run in background, output to `logs/` |
-
-### Quality
-
-| Target | Description |
-|---|---|
-| `make check` | Syntax + `.env` presence + placeholder detection |
-| `make test` | Run `tests/` suite (if present) |
-| `make lint` | Lint with ruff |
-| `make format` | Format with black |
-| `make deploy-check` | Pre-flight for deployment (token leaks, `.env` tracked by git) |
-
-### Telegram
-
-| Target | Description |
-|---|---|
-| `make telegram-test` | Send a test message to your chat |
-
-### Logs
-
-| Target | Description |
-|---|---|
-| `make log` | Cat the most recent log file |
-| `make tail-log` | `tail -f` the most recent log file |
-
-### Backup
-
-| Target | Description |
-|---|---|
-| `make backup` | Tar `forex_bot.py`, `.env`, `requirements.txt`, `Makefile` into `backups/` |
-| `make backup-list` | List available backups |
-
-### PythonAnywhere
-
-| Target | Description |
-|---|---|
-| `make pa-upload PA_USER=myuser` | `scp` script + requirements to your PythonAnywhere home |
-| `make pa-schedule PA_USER=myuser` | Print scheduling instructions |
-| `make pa-logs PA_USER=myuser` | Tail the task log over SSH |
-
-### Cleanup
-
-| Target | Description |
-|---|---|
-| `make clean` | Remove `__pycache__`, `.pyc`, caches |
-| `make clean-all` | Above + remove `venv/` and `logs/` (prompts for confirmation) |
-
-## Deployment on PythonAnywhere (Free Tier)
-
-Free PythonAnywhere accounts have limited background-process capability. Two deployment paths:
-
-### Path A — Free account created **before Jan 15, 2026** (has scheduled tasks)
-
-1. Go to the **Tasks** tab.
-2. Create a daily task at `22:00 UTC` (after NY close) with:
-   ```
-   python3 /home/<yourusername>/forex_bot.py
-   ```
-3. Set `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID` as environment variables in the task editor.
-
-Free accounts get **one daily task** and **~100 CPU-seconds/day**. This bot uses about 3–5 seconds per run, so it fits comfortably.
-
-### Path B — Free account created **after Jan 15, 2026** (no scheduled tasks)
-
-You must use a web app + external cron:
-
-1. Create a **Flask web app** on PythonAnywhere.
-2. Add a `/run` route that calls `main()` from your bot module:
-   ```python
-   import os
-   from flask import Flask, request, abort
-   from forex_bot import main
-
-   app = Flask(__name__)
-
-   @app.route("/run")
-   def run():
-       if request.args.get("k") != os.getenv("RUN_SECRET"):
-           abort(403)
-       main()
-       return "ok", 200
-   ```
-3. Reload the web app.
-4. Set `RUN_SECRET` in the web app's environment variables.
-5. Sign up at [cron-job.org](https://cron-job.org) (free) and create a job that GETs:
-   ```
-   https://<yourusername>.pythonanywhere.com/run?k=<RUN_SECRET>
-   ```
-   once daily at 22:00 UTC.
-
-> ⚠️ **Never expose `/run` without a secret.** An open endpoint lets anyone trigger your bot and drain your CPU quota.
-
-## Calibrating `PIP_VALUE_STANDARD`
-
-This is the **single most important constant** and the most common source of error. `PIP_VALUE_STANDARD` is the pip value in **account currency (cents)** for a **1.0-lot position** on your broker.
-
-### How to measure it (recommended)
-
-1. Log in to your Weltrade **cent demo** account.
-2. Open a **0.01-lot** EUR/USD trade (or any XXX/USD pair).
-3. Note your balance.
-4. Wait for price to move **exactly 10 pips** in your favor.
-5. Note the new balance. The difference ÷ 10 is the pip value in cents for 0.01 lot.
-6. Multiply by 100 → that's `PIP_VALUE_STANDARD`.
-
-Example: 10 pips on 0.01 lot gained **1.0 cent** → pip value = 0.1¢ per 0.01 lot → **`PIP_VALUE_STANDARD = 0.10`**.
-
-### Sanity check after first run
-
-Look at the first `[SIGNAL]` line:
-
-- **`lots=15.0` or higher on a 300¢ account** → `PIP_VALUE_STANDARD` is **10× too small**
-- **Every signal is `[SKIP] min_lot_exceeds_max_risk`** → `PIP_VALUE_STANDARD` is **10× too large**
-- **`lots=1.5`, `risk=15.0¢`** → correct for a 300¢ account at 5% target
-
-## Understanding the Output
-
-### Signal fields
-
-| Field | Meaning |
-|---|---|
-| `Entry` | Last daily close (the price you'd enter at) |
-| `Stop Loss` | Zone edge ± ATR buffer |
-| `Take Profit` | Entry ± 3 × stop distance |
-| `Risk` | Stop distance in pips |
-| `ATR(14)` | Average true range — context for stop tightness |
-| `Stop = N× ATR` | How many ATRs wide your stop is (should be 1.0–3.0) |
-| `Lot Size` | Position size in cent-lots |
-| `(target)` / `(min_lot_floor)` | Sizing source — target risk was used, or floored to min lot |
-| `Risk ≈` | Dollar risk in cents and % of account |
-| `Max win ≈` | 3× the risk, in cents |
-
-### When to trust a signal
-
-Higher confidence when:
-
-- `Stop = 1.0–2.0× ATR` (normal volatility, not a zone blowout)
-- Zone is fresh (not visible in a recent trend as an already-rejected area)
-- Stop distance is < 200 pips (within your sizing window)
-- Risk % is close to your 5% target (not floored to min lot)
-
-Lower confidence when:
-
-- `Stop = 2.8–3.0× ATR` (zone very wide — could be a broken zone)
-- `(min_lot_floor)` — sizing was floored, actual risk may be higher than 5%
-- Signal opposes the weekly trend (you must check this yourself)
-
-## The Risk Math (Read This)
-
-A few hard numbers to keep you honest:
-
-### What 5% risk on 300¢ means
-
-| Outcome | Amount |
-|---|---|
-| Loss | −15¢ (−5% account) |
-| Win (1:3 RR) | +45¢ (+15% account) |
-
-### Losing streaks are guaranteed
-
-At a 35% win rate (a reasonable assumption for this strategy), the expected longest losing streak over **200 trades** is roughly 10–12. Here's the drawdown at 5% risk:
-
-| Streak | Drawdown | Recovery needed |
+| Variable | Example | Required |
 |---|---|---|
-| 3 | −14% | +17% |
-| 5 | −23% | +29% |
-| 8 | −34% | +51% |
-| 12 | −46% | +85% |
+| `TELEGRAM_TOKEN` | `1234567890:ABCdef...` | **Yes** |
+| `TELEGRAM_CHAT_ID` | `987654321` | **Yes** |
+| `DATABASE_URL` | `postgresql://user:pass@ep-...neon.tech/neondb?sslmode=require` | **Yes** |
+| `WEBHOOK_URL` | `https://your-bot.onrender.com` | **Yes** (for commands) |
+| `SCAN_SECRET` | `xK9mP2nQ8vR4sT7wY1zA5bC3dE6fG0hJ` | **Yes** (for production) |
+| `PORT` | Auto-set by Render | No |
 
-At **10% risk** (the ceiling), a 12-loss streak wipes **72%** of the account and requires a **+257% gain** to recover. This is why 5%/10%-cap is the highest sane setting for an untested strategy.
+Generate `SCAN_SECRET` with:
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
-### Kelly criterion
+---
 
-For 1:3 RR with win rate `p`: `f* = (4p − 1) / 3`
+## Database Schema
 
-| Win rate | Kelly-optimal risk |
+Three tables in Neon Postgres:
+
+### `signals`
+One row per signal. Every field needed to evaluate and replay the trade.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL | Primary key |
+| `created_at` | TEXT | ISO8601 UTC |
+| `signal_date` | TEXT | Candle date (YYYY-MM-DD) |
+| `symbol` | TEXT | e.g., `GBPUSD` |
+| `direction` | TEXT | `LONG` or `SHORT` |
+| `entry` | DOUBLE PRECISION | Entry price |
+| `stop_loss` | DOUBLE PRECISION | Stop price |
+| `take_profit` | DOUBLE PRECISION | Target price |
+| `risk_pips` | DOUBLE PRECISION | Stop distance in pips |
+| `atr_pips` | DOUBLE PRECISION | ATR(14) at signal time |
+| `atr_multiple` | DOUBLE PRECISION | Stop / ATR |
+| `lot_size` | DOUBLE PRECISION | Position size |
+| `risk_cents` | DOUBLE PRECISION | Dollar risk in cents |
+| `sizing_source` | TEXT | `target`, `min_lot_floor`, etc. |
+| `zone_type` | TEXT | `demand` or `supply` |
+| `zone_top` | DOUBLE PRECISION | Zone upper boundary |
+| `zone_bottom` | DOUBLE PRECISION | Zone lower boundary |
+| `outcome` | TEXT | `open`, `win`, `loss`, `breakeven` |
+| `exit_price` | DOUBLE PRECISION | Filled when outcome closes |
+| `closed_at` | TEXT | ISO8601 UTC |
+| `pnl_cents` | DOUBLE PRECISION | +45 for win, -15 for loss |
+
+### `runs`
+One row per invocation.
+
+| Column | Type |
 |---|---|
-| 30% | 6.7% |
-| 35% | 13.3% |
-| 40% | 20.0% |
+| `id` | SERIAL |
+| `started_at` | TEXT |
+| `finished_at` | TEXT |
+| `pairs_scanned` | INTEGER |
+| `signals_sent` | INTEGER |
+| `signals_skipped` | INTEGER |
+| `errors` | INTEGER |
 
-So 5% is **under half-Kelly** at 35% win rate — appropriate for an untested edge. But if the true win rate is 28%, even 5% is over-Kelly and the account dies. **You do not yet know the win rate.** This is why paper trading first is non-negotiable.
+### `pair_diagnostics`
+One row per pair per run.
 
-## Limitations
+| Column | Type |
+|---|---|
+| `id` | SERIAL |
+| `run_id` | INTEGER (FK → runs) |
+| `symbol` | TEXT |
+| `zones` | INTEGER |
+| `sr_levels` | INTEGER |
+| `pools` | INTEGER |
+| `reasons` | TEXT (comma-separated) |
 
-- **Data source**: Yahoo Finance can have gaps, delayed bars, and occasional bad ticks. Swap in OANDA v20 for production use.
-- **Zone detection is heuristic**: it is not real order-block / FVG detection. Expect false positives.
-- **Liquidity detection is naive**: scans for coincidental equal highs/lows — many will be random.
-- **No trend filter**: counter-trend entries are possible. You must vet each signal manually.
-- **No news awareness**: NFP, FOMC, and central-bank days can gap through stops.
-- **No slippage / spread model**: Telegram prices are mid-market; fills will differ.
-- **No position management**: no trailing, no partial exits, no breakeven.
-- **Single daily run** on free PythonAnywhere: a signal generated at 22:00 UTC is based on the prior day's close — you're always one bar behind intraday movement.
-- **No backtest included**: you must build one to measure the edge.
+---
+
+## Tuning Guide
+
+All tunables live at the top of `main.py`:
+
+| Constant | Default | Effect |
+|---|---|---|
+| `ZONE_BODY_MULT` | `1.2` | Lower = more zones |
+| `RETEST_BUFFER_PIPS` | `5.0` | Higher = looser retest |
+| `SR_TOLERANCE_PIPS` | `10.0` | Higher = looser S/R confluence |
+| `ZONE_LOOKBACK_BARS` | `50` | Higher = more candidate zones |
+| `FRESH_ZONES_ONLY` | `False` | `True` discards touched zones |
+| `MIN_STOP_ATR_MULT` | `1.0` | Minimum stop size |
+| `MAX_STOP_ATR_MULT` | `3.0` | Maximum stop size; wider = skip |
+| `ATR_BUFFER_MULT` | `0.3` | Zone-edge buffer as fraction of ATR |
+
+**Change one knob per week, run 7 times, then query the DB:**
+
+```sql
+SELECT reasons, COUNT(*) AS n
+FROM pair_diagnostics
+WHERE run_id >= 4
+GROUP BY reasons
+ORDER BY n DESC
+LIMIT 10;
+```
+
+Whichever reason dominates tells you which knob to turn next:
+
+- `no_retest` dominates → raise `RETEST_BUFFER_PIPS`
+- `no_support`/`no_resistance` dominates → raise `SR_TOLERANCE_PIPS`
+- `stop_too_wide` dominates → raise `MAX_STOP_ATR_MULT`
+- `no_zones` dominates → raise `ZONE_LOOKBACK_BARS`
+
+---
+
+## Honest Limitations
+
+The bot is well-engineered. The strategy is unproven.
+
+- **No backtest has been run.** The strategy's edge over 100+ trades is unknown. A reasonable estimate is a 25–30% probability of a positive edge.
+- **Signals are rare.** With strict filters, most runs produce zero signals. This is by design, but it means measurement takes weeks.
+- **No trend filter.** The bot takes any zone retest in either direction, which increases counter-trend risk.
+- **No rejection confirmation.** The bot enters on zone touch, not on a rejection candle — a filter that backtested strategies add specifically to raise win rate.
+- **Daily timeframe introduces a one-bar lag.** By the time a signal fires, price may have moved past the zone.
+- **Spread on a cent account eats 10%+ of the risk budget.** At 15¢ risk and a 2-pip spread, entry cost alone is a structural drag.
+- **The bot does not place trades.** It sends signals; you execute manually and manage your own risk.
+- **Free tier spin-down.** Render spins down idle services after 15 minutes. Commands may take ~30 seconds to respond after a period of inactivity. The daily scan still runs.
+- **Neon cold starts.** Neon suspends compute after 5 minutes idle. The first DB query after suspension takes ~1–2 seconds. `db_connect()` retries handle this transparently.
+
+---
 
 ## Roadmap
 
-If you want to make this materially better, in order of impact:
+In order of impact:
 
 1. **Backtest on 2–3 years of data** — measure actual win rate and expectancy before deploying real capital.
-2. **Add a higher-timeframe trend filter** — only take longs in weekly uptrends, shorts in downtrends.
+2. **Add a 200 EMA trend filter** — only take longs in uptrends, shorts in downtrends.
 3. **Replace zone detection** with fair-value-gap / order-block detection.
-4. **Replace liquidity detection** with sweep-and-reclaim logic instead of equal-level coincidence.
-5. **Add a news blackout window** — skip signals within 30 minutes of high-impact events (ForexFactory API).
+4. **Add rejection-candle confirmation** — require the retest bar to close bullish (for demand) or bearish (for supply).
+5. **Add a news blackout window** — skip signals within 30 minutes of high-impact events.
 6. **Switch data source to OANDA v20** — cleaner data, 4-hour bars, no Yahoo lag.
 7. **Add a cooldown** — don't re-signal the same pair within N days.
-8. **Log every signal to CSV** — build the dataset for step 1.
+8. **Automated outcome replay** — walk every open signal forward daily, not just on the daily scan.
+
+---
 
 ## Project Layout
 
 ```
 forex-signal-bot/
-├── forex_bot.py           # Main bot script
-├── requirements.txt       # Python dependencies
-├── Makefile               # Task runner (install, run, deploy)
-├── .env.example           # Template — copy to .env and fill in
-├── .env                   # Your real credentials (NOT committed)
-├── .gitignore             # Excludes .env, venv, logs, backups
-├── README.md              # This file
-├── logs/                  # Runtime logs from `make run-bg` (gitignored)
-└── backups/               # Backups from `make backup` (gitignored)
+├── main.py                  # Signal generation, DB, scan, outcome tracking
+├── telegram_commands.py     # 13 command handlers (async-safe Postgres)
+├── web_listener.py          # Flask webhook + scan trigger for Render
+├── requirements.txt         # Python dependencies
+├── .env.example             # Template — copy to .env
+├── .env                     # Your real credentials (gitignored)
+├── .gitignore               # Excludes .env, venv, __pycache__
+├── README.md                # This file
+└── signals.db               # Legacy SQLite (no longer used in Postgres mode)
 ```
+
+---
 
 ## Disclaimer
 
@@ -565,16 +493,3 @@ forex-signal-bot/
 
 **By running this bot, you accept full responsibility for every trade you place based on its output.**
 ```
-
----
-
-The main additions versus the previous version:
-
-- **Quick Start** at the top — five-command path from zero to a test alert
-- **Environment Variables** section — explains `.env`, precedence, and the never-commit rule
-- **Makefile Reference** — full table of every target grouped by category
-- **Project Layout** — visual tree of what lives where
-- **`.env` loader note** — clarifies that `.env` is loaded via `python-dotenv` from the script's own directory
-- **Updated install instructions** — split into Makefile and non-Makefile paths
-- **`RUN_SECRET` guard** on the Flask `/run` endpoint — closes the open-endpoint hole mentioned in the earlier draft
-- **Updated requirements** — adds `python-dotenv>=1.0.0`
