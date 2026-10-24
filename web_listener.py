@@ -36,6 +36,13 @@ from telegram import Update
 from telegram_commands import build_application
 import main as bot_main
 
+
+# Get the absolute path to the directory containing web_listener.py
+BASE_DIR = Path(__file__).resolve().parent
+
+# Tell Flask to look exactly in BASE_DIR/templates
+app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
+
 # ============================================================
 # STARTUP VALIDATION
 # ============================================================
@@ -123,6 +130,58 @@ _register_webhook()
 app = Flask(__name__)
 
 
+@app.route("/dashboard")
+def dashboard():
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        # Connect to Neon
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        conn.autocommit = True
+        
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. Get recent signals
+            cur.execute("""
+                SELECT created_at, symbol, direction, entry, stop_loss, 
+                       take_profit, lot_size, outcome, pnl_cents 
+                FROM signals 
+                ORDER BY id DESC LIMIT 50
+            """)
+            signals = cur.fetchall()
+            
+            # 2. Get aggregate stats
+            cur.execute("""
+                SELECT 
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN outcome = 'open' THEN 1 ELSE 0 END) AS open_n,
+                    SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
+                    COALESCE(SUM(pnl_cents), 0) AS pnl
+                FROM signals
+            """)
+            totals = cur.fetchone()
+            
+        conn.close()
+        
+        # Calculate Win Rate
+        closed = (totals["wins"] or 0) + (totals["losses"] or 0)
+        win_rate = round(((totals["wins"] or 0) / closed * 100), 1) if closed else 0.0
+        
+        stats = {
+            "total": totals["total"],
+            "open": totals["open_n"] or 0,
+            "win_rate": win_rate,
+            "pnl": round(totals["pnl"], 1)
+        }
+        
+        return render_template("dashboard.html", signals=signals, stats=stats)
+        
+    except Exception as e:
+        return f"Dashboard Error: {e}", 500
+
+
+
 @app.route("/health")
 def health():
     return "ok", 200
@@ -176,55 +235,6 @@ def run_scan():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route("/dashboard")
-def dashboard():
-    try:
-        import psycopg2
-        import psycopg2.extras
-        
-        # Connect to Neon
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-        conn.autocommit = True
-        
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # 1. Get recent signals
-            cur.execute("""
-                SELECT created_at, symbol, direction, entry, stop_loss, 
-                       take_profit, lot_size, outcome, pnl_cents 
-                FROM signals 
-                ORDER BY id DESC LIMIT 50
-            """)
-            signals = cur.fetchall()
-            
-            # 2. Get aggregate stats
-            cur.execute("""
-                SELECT 
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN outcome = 'open' THEN 1 ELSE 0 END) AS open_n,
-                    SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins,
-                    SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
-                    COALESCE(SUM(pnl_cents), 0) AS pnl
-                FROM signals
-            """)
-            totals = cur.fetchone()
-            
-        conn.close()
-        
-        # Calculate Win Rate
-        closed = (totals["wins"] or 0) + (totals["losses"] or 0)
-        win_rate = round(((totals["wins"] or 0) / closed * 100), 1) if closed else 0.0
-        
-        stats = {
-            "total": totals["total"],
-            "open": totals["open_n"] or 0,
-            "win_rate": win_rate,
-            "pnl": round(totals["pnl"], 1)
-        }
-        
-        return render_template("dashboard.html", signals=signals, stats=stats)
-        
-    except Exception as e:
-        return f"Dashboard Error: {e}", 500
 
 # ============================================================
 # ENTRYPOINT
