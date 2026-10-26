@@ -60,7 +60,7 @@ MIN_STOP_ATR_MULT = 0.5
 MAX_STOP_ATR_MULT = 1.5       
 
 RR_RATIO           = 2.0      
-RETEST_BUFFER_PIPS = 3.0      # UPDATED: Widened from 1.5 to 3.0
+RETEST_BUFFER_PIPS = 3.0      # Checks last 3 candles
 SR_TOLERANCE_PIPS  = 3.0      
 ZONE_BODY_MULT     = 1.5      
 
@@ -95,7 +95,7 @@ def db_init():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.signals (
+            CREATE TABLE IF NOT EXISTS signals (
                 id              SERIAL PRIMARY KEY,
                 created_at      TEXT NOT NULL,
                 signal_date     TEXT,
@@ -118,11 +118,11 @@ def db_init():
                 closed_at       TEXT,
                 pnl_cents       DOUBLE PRECISION
             );
-            CREATE INDEX IF NOT EXISTS idx_signals_created ON public.signals(created_at);
-            CREATE INDEX IF NOT EXISTS idx_signals_symbol ON public.signals(symbol, created_at);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique ON public.signals(symbol, direction, signal_date);
+            CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);
+            CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique ON signals(symbol, direction, signal_date);
 
-            CREATE TABLE IF NOT EXISTS public.runs (
+            CREATE TABLE IF NOT EXISTS runs (
                 id              SERIAL PRIMARY KEY,
                 started_at      TEXT NOT NULL,
                 finished_at     TEXT,
@@ -132,16 +132,16 @@ def db_init():
                 errors          INTEGER DEFAULT 0
             );
 
-            CREATE TABLE IF NOT EXISTS public.pair_diagnostics (
+            CREATE TABLE IF NOT EXISTS pair_diagnostics (
                 id          SERIAL PRIMARY KEY,
-                run_id      INTEGER NOT NULL REFERENCES public.runs(id),
+                run_id      INTEGER NOT NULL REFERENCES runs(id),
                 symbol      TEXT NOT NULL,
                 zones       INTEGER,
                 sr_levels   INTEGER,
                 pools       INTEGER,
                 reasons     TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_diag_run ON public.pair_diagnostics(run_id);
+            CREATE INDEX IF NOT EXISTS idx_diag_run ON pair_diagnostics(run_id);
             """)
         conn.commit()
     finally:
@@ -151,7 +151,7 @@ def db_insert_run_start(started_at):
     conn = db_connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.runs (started_at) VALUES (%s) RETURNING id", (started_at,))
+            cur.execute("INSERT INTO runs (started_at) VALUES (%s) RETURNING id", (started_at,))
             run_id = cur.fetchone()[0]
         conn.commit()
         return run_id
@@ -159,90 +159,108 @@ def db_insert_run_start(started_at):
         conn.close()
 
 def db_finish_run(run_id, pairs_scanned, signals_sent, signals_skipped, errors):
-    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE public.runs SET finished_at=%s, pairs_scanned=%s,
-                                signals_sent=%s, signals_skipped=%s, errors=%s
-                WHERE id=%s
-            """, (datetime.now(timezone.utc).isoformat(),
-                  pairs_scanned, signals_sent, signals_skipped, errors, run_id))
-        conn.commit()
-    finally:
-        conn.close()
+        conn = db_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE runs SET finished_at=%s, pairs_scanned=%s,
+                                    signals_sent=%s, signals_skipped=%s, errors=%s
+                    WHERE id=%s
+                """, (datetime.now(timezone.utc).isoformat(),
+                      pairs_scanned, signals_sent, signals_skipped, errors, run_id))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] db_finish_run: {e}")
 
 def db_insert_diagnostic(run_id, symbol, diag):
-    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.pair_diagnostics
-                    (run_id, symbol, zones, sr_levels, pools, reasons)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (run_id, symbol, diag["zones"], diag["sr"], diag["pools"],
-                  ",".join(sorted(set(diag["reasons"])))))
-        conn.commit()
-    finally:
-        conn.close()
+        conn = db_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO pair_diagnostics
+                        (run_id, symbol, zones, sr_levels, pools, reasons)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (run_id, symbol, diag["zones"], diag["sr"], diag["pools"],
+                      ",".join(sorted(set(diag["reasons"])))))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] db_insert_diagnostic ({symbol}): {e}")
 
 def db_insert_signal(signal, lot_size, risk_cents, source):
-    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.signals
-                    (created_at, signal_date, symbol, direction, entry, stop_loss,
-                     take_profit, risk_pips, atr_pips, atr_multiple,
-                     lot_size, risk_cents, sizing_source, zone_type,
-                     zone_top, zone_bottom)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (symbol, direction, signal_date) DO NOTHING
-                RETURNING id
-            """, (
-                datetime.now(timezone.utc).isoformat(),
-                signal["signal_date"],
-                signal["symbol"], signal["direction"],
-                signal["entry"], signal["stop"], signal["target"],
-                signal["risk_pips"], signal["atr_pips"], signal["atr_multiple"],
-                lot_size, risk_cents, source,
-                signal["zone"]["type"],
-                signal["zone"]["top"], signal["zone"]["bottom"],
-            ))
-            inserted = cur.fetchone() is not None
-        conn.commit()
-        return inserted
-    finally:
-        conn.close()
+        conn = db_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO signals
+                        (created_at, signal_date, symbol, direction, entry, stop_loss,
+                         take_profit, risk_pips, atr_pips, atr_multiple,
+                         lot_size, risk_cents, sizing_source, zone_type,
+                         zone_top, zone_bottom)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, direction, signal_date) DO NOTHING
+                    RETURNING id
+                """, (
+                    datetime.now(timezone.utc).isoformat(),
+                    signal["signal_date"],
+                    signal["symbol"], signal["direction"],
+                    signal["entry"], signal["stop"], signal["target"],
+                    signal["risk_pips"], signal["atr_pips"], signal["atr_multiple"],
+                    lot_size, risk_cents, source,
+                    signal["zone"]["type"],
+                    signal["zone"]["top"], signal["zone"]["bottom"],
+                ))
+                inserted = cur.fetchone() is not None
+            conn.commit()
+            return inserted
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] db_insert_signal: {e}")
+        return False
 
 def db_has_open_signal(symbol, direction):
-    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT 1 FROM public.signals
-                WHERE symbol=%s AND direction=%s AND outcome='open'
-                LIMIT 1
-            """, (symbol, direction))
-            return cur.fetchone() is not None
-    finally:
-        conn.close()
+        conn = db_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 1 FROM signals
+                    WHERE symbol=%s AND direction=%s AND outcome='open'
+                    LIMIT 1
+                """, (symbol, direction))
+                return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] db_has_open_signal: {e}")
+        return False
 
 def db_get_todays_signal_count():
-    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            cur.execute("""
-                SELECT COUNT(*) FROM public.signals 
-                WHERE created_at LIKE %s
-            """, (f"{today_str}%",))
-            return cur.fetchone()[0]
-    finally:
-        conn.close()
+        conn = db_connect()
+        try:
+            with conn.cursor() as cur:
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                cur.execute("""
+                    SELECT COUNT(*) FROM signals 
+                    WHERE created_at LIKE %s
+                """, (f"{today_str}%",))
+                return cur.fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] db_get_todays_signal_count: {e}")
+        return 0
 
 # ============================================================
-# DATA
+# DATA & INDICATORS
 # ============================================================
 def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
     try:
@@ -566,17 +584,21 @@ def calculate_lot_size(stop_pips):
 # OUTCOME TRACKING
 # ============================================================
 def update_open_signals():
-    conn = db_connect()
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id, symbol, direction, stop_loss, take_profit,
-                       risk_cents, signal_date, created_at
-                FROM public.signals WHERE outcome = 'open'
-            """)
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+        conn = db_connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, symbol, direction, stop_loss, take_profit,
+                           risk_cents, signal_date, created_at
+                    FROM signals WHERE outcome = 'open'
+                """)
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] update_open_signals: {e}")
+        return 0
 
     if not rows:
         return 0
@@ -629,18 +651,23 @@ def update_open_signals():
     if not updates:
         return 0
 
-    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            for sid, outcome, exit_price, closed_at, pnl in updates:
-                cur.execute("""
-                    UPDATE public.signals
-                    SET outcome=%s, exit_price=%s, closed_at=%s, pnl_cents=%s
-                    WHERE id=%s
-                """, (outcome, exit_price, closed_at, pnl, sid))
-        conn.commit()
-    finally:
-        conn.close()
+        conn = db_connect()
+        try:
+            with conn.cursor() as cur:
+                for sid, outcome, exit_price, closed_at, pnl in updates:
+                    cur.execute("""
+                        UPDATE signals
+                        SET outcome=%s, exit_price=%s, closed_at=%s, pnl_cents=%s
+                        WHERE id=%s
+                    """, (outcome, exit_price, closed_at, pnl, sid))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] update_outcomes: {e}")
+        return 0
+        
     return len(updates)
 
 # ============================================================
@@ -726,7 +753,7 @@ def run_scan():
                         else:
                             inserted = db_insert_signal(signal, lots, risk_cents, source)
                             if not inserted:
-                                print(f"[DUP] {pair} {signal['direction']}: already sent")
+                                print(f"[DUP] {pair} {signal['direction']}: already sent or DB error")
                                 signal = None
                             else:
                                 print(f"[SIGNAL] {pair} {signal['direction']} | lots={lots} | risk={risk_cents:.1f}¢")
