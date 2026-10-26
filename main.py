@@ -249,7 +249,7 @@ def db_get_todays_signal_count():
 # ============================================================
 def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
     try:
-        # FIX: Use Ticker.history() instead of yf.download() to prevent data bleeding between pairs
+        # Use Ticker.history() instead of yf.download() to prevent data bleeding
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval, auto_adjust=False)
         
@@ -521,8 +521,7 @@ def generate_signal(df, symbol):
             diag["reasons"].append("no_matching_direction")
         return None, diag
 
-    except ValueError as e:
-        # FIX: Catch pandas ValueError so it doesn't crash the scan
+    except ValueError:
         diag["reasons"].append("error ValueError")
         return None, diag
     except Exception as e:
@@ -648,8 +647,7 @@ async def send_telegram(signal, lot_size, risk_cents, source):
         f"Stop Loss: `{signal['stop']}`\n"
         f"Take Profit: `{signal['target']}`\n"
         f"Risk: {signal['risk_pips']} pips (1:{int(RR_RATIO)} RR)\n"
-        f"ATR({ATR_PERIOD}): {signal['atr_pips']} pips | "
-        f"Stop = {signal['atr_multiple']}× ATR\n"
+        f"ATR({ATR_PERIOD}): {signal['atr_pips']} pips\n"
         f"Lot Size: `{lot_size}` ({source})\n"
         f"Risk ≈ {risk_cents:.1f}¢ ({risk_pct:.1f}%)\n"
         f"Max Win ≈ {reward_cents:.1f}¢\n"
@@ -731,7 +729,6 @@ def run_scan():
             signal = None
         
         finally:
-            # FIX: Only append to per_pair ONCE per pair, at the end of the loop
             per_pair.append((pair, signal, diag))
 
     db_finish_run(run_id, pairs_scanned, signals_sent, signals_skipped, errors)
