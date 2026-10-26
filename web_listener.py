@@ -107,43 +107,39 @@ def run_scan():
     if SCAN_SECRET and request.args.get("k") != SCAN_SECRET:
         abort(403)
     
-    try:
-        result = bot_main.run_scan()
-        
-        msg = (
-            f"🤖 *Cron Job Triggered*\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"Pairs Scanned: `{result.get('pairs_scanned', 0)}`\n"
-            f"Signals Sent: `{result.get('signals_sent', 0)}`\n"
-            f"Skipped: `{result.get('signals_skipped', 0)}`\n"
-            f"Errors: `{result.get('errors', 0)}`\n"
-            f"Run ID: `{result.get('run_id', 0)}`"
-        )
-        
+    # 1. Define the background task
+    def _background_scan():
+        try:
+            # Run the heavy scan
+            result = bot_main.run_scan()
+            
+            msg = (
+                f"🤖 *Cron Job Triggered*\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"Pairs Scanned: `{result.get('pairs_scanned', 0)}`\n"
+                f"Signals Sent: `{result.get('signals_sent', 0)}`\n"
+                f"Skipped: `{result.get('signals_skipped', 0)}`\n"
+                f"Errors: `{result.get('errors', 0)}`\n"
+                f"Run ID: `{result.get('run_id', 0)}`"
+            )
+        except Exception as e:
+            traceback.print_exc()
+            msg = f"❌ *Scan Failed!*\n\n`{type(e).__name__}: {e}`"
+
+        # Send message via the background event loop
         async def _send_msg():
             await telegram_app.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=msg,
                 parse_mode="Markdown"
             )
-        
         asyncio.run_coroutine_threadsafe(_send_msg(), _loop)
-        
-        return jsonify({"status": "ok", "result": result}), 200
-        
-    except Exception as e:
-        traceback.print_exc()
-        
-        err_msg = f"❌ *Scan Failed!*\n\n`{type(e).__name__}: {e}`"
-        async def _send_err():
-            await telegram_app.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=err_msg,
-                parse_mode="Markdown"
-            )
-        asyncio.run_coroutine_threadsafe(_send_err(), _loop)
-        
-        return jsonify({"status": "error", "message": str(e)}), 500
+
+    # 2. Start the background task
+    threading.Thread(target=_background_scan).start()
+
+    # 3. Return IMMEDIATELY to cron-job.org with a tiny response
+    return jsonify({"status": "accepted", "message": "Scan started"}), 200
 
 @app.route("/dashboard")
 def dashboard():
@@ -154,16 +150,9 @@ def dashboard():
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         conn.autocommit = True
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # 1. Fetch Recent Signals
-            cur.execute("""
-                SELECT created_at, symbol, direction, entry, stop_loss, 
-                       take_profit, lot_size, outcome, pnl_cents 
-                FROM signals 
-                ORDER BY id DESC LIMIT 50
-            """)
+            cur.execute("SELECT created_at, symbol, direction, entry, stop_loss, take_profit, lot_size, outcome, pnl_cents FROM signals ORDER BY id DESC LIMIT 50")
             signals = cur.fetchall()
             
-            # 2. Fetch Aggregate Signal Stats
             cur.execute("""
                 SELECT COUNT(*) AS total,
                     SUM(CASE WHEN outcome = 'open' THEN 1 ELSE 0 END) AS open_n,
@@ -174,7 +163,6 @@ def dashboard():
             """)
             totals = cur.fetchone()
             
-            # 3. Fetch Recent Runs (Cron Jobs)
             cur.execute("""
                 SELECT id, started_at, pairs_scanned, signals_sent, signals_skipped, errors
                 FROM runs 
