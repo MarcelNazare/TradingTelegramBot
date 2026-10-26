@@ -77,16 +77,14 @@ PAIRS = [
 ]
 
 # ============================================================
-# DATABASE
+# DATABASE (Explicitly using public schema)
 # ============================================================
 def db_connect():
     for attempt in range(3):
         try:
-            conn = psycopg2.connect(DATABASE_URL)
+            # FIX: Pass options to force the search_path at connection startup
+            conn = psycopg2.connect(DATABASE_URL, options="-c search_path=public")
             conn.autocommit = False
-            with conn.cursor() as cur:
-                # FIX: Force Neon to use the public schema
-                cur.execute("SET search_path TO public;")
             return conn
         except psycopg2.OperationalError:
             if attempt == 2:
@@ -97,8 +95,9 @@ def db_init():
     conn = db_connect()
     try:
         with conn.cursor() as cur:
+            # FIX: Explicitly prefix tables with public.
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
+            CREATE TABLE IF NOT EXISTS public.signals (
                 id              SERIAL PRIMARY KEY,
                 created_at      TEXT NOT NULL,
                 signal_date     TEXT,
@@ -121,11 +120,11 @@ def db_init():
                 closed_at       TEXT,
                 pnl_cents       DOUBLE PRECISION
             );
-            CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);
-            CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol, created_at);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique ON signals(symbol, direction, signal_date);
+            CREATE INDEX IF NOT EXISTS idx_signals_created ON public.signals(created_at);
+            CREATE INDEX IF NOT EXISTS idx_signals_symbol ON public.signals(symbol, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique ON public.signals(symbol, direction, signal_date);
 
-            CREATE TABLE IF NOT EXISTS runs (
+            CREATE TABLE IF NOT EXISTS public.runs (
                 id              SERIAL PRIMARY KEY,
                 started_at      TEXT NOT NULL,
                 finished_at     TEXT,
@@ -135,16 +134,16 @@ def db_init():
                 errors          INTEGER DEFAULT 0
             );
 
-            CREATE TABLE IF NOT EXISTS pair_diagnostics (
+            CREATE TABLE IF NOT EXISTS public.pair_diagnostics (
                 id          SERIAL PRIMARY KEY,
-                run_id      INTEGER NOT NULL REFERENCES runs(id),
+                run_id      INTEGER NOT NULL REFERENCES public.runs(id),
                 symbol      TEXT NOT NULL,
                 zones       INTEGER,
                 sr_levels   INTEGER,
                 pools       INTEGER,
                 reasons     TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_diag_run ON pair_diagnostics(run_id);
+            CREATE INDEX IF NOT EXISTS idx_diag_run ON public.pair_diagnostics(run_id);
             """)
         conn.commit()
     finally:
@@ -154,7 +153,7 @@ def db_insert_run_start(started_at):
     conn = db_connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO runs (started_at) VALUES (%s) RETURNING id", (started_at,))
+            cur.execute("INSERT INTO public.runs (started_at) VALUES (%s) RETURNING id", (started_at,))
             run_id = cur.fetchone()[0]
         conn.commit()
         return run_id
@@ -166,7 +165,7 @@ def db_finish_run(run_id, pairs_scanned, signals_sent, signals_skipped, errors):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE runs SET finished_at=%s, pairs_scanned=%s,
+                UPDATE public.runs SET finished_at=%s, pairs_scanned=%s,
                                 signals_sent=%s, signals_skipped=%s, errors=%s
                 WHERE id=%s
             """, (datetime.now(timezone.utc).isoformat(),
@@ -180,11 +179,11 @@ def db_insert_diagnostic(run_id, symbol, diag):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO pair_diagnostics
+                INSERT INTO public.pair_diagnostics
                     (run_id, symbol, zones, sr_levels, pools, reasons)
                 VALUES (%s, %s, %s, %s, %s, %s)
             """, (run_id, symbol, diag["zones"], diag["sr"], diag["pools"],
-                  ",".join(diag["reasons"])))
+                  ",".join(sorted(set(diag["reasons"]))))) # FIX: Deduplicate reasons
         conn.commit()
     finally:
         conn.close()
@@ -194,7 +193,7 @@ def db_insert_signal(signal, lot_size, risk_cents, source):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO signals
+                INSERT INTO public.signals
                     (created_at, signal_date, symbol, direction, entry, stop_loss,
                      take_profit, risk_pips, atr_pips, atr_multiple,
                      lot_size, risk_cents, sizing_source, zone_type,
@@ -223,7 +222,7 @@ def db_has_open_signal(symbol, direction):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 1 FROM signals
+                SELECT 1 FROM public.signals
                 WHERE symbol=%s AND direction=%s AND outcome='open'
                 LIMIT 1
             """, (symbol, direction))
@@ -237,7 +236,7 @@ def db_get_todays_signal_count():
         with conn.cursor() as cur:
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             cur.execute("""
-                SELECT COUNT(*) FROM signals 
+                SELECT COUNT(*) FROM public.signals 
                 WHERE created_at LIKE %s
             """, (f"{today_str}%",))
             return cur.fetchone()[0]
@@ -245,11 +244,10 @@ def db_get_todays_signal_count():
         conn.close()
 
 # ============================================================
-# DATA (Fixed YFinance Caching Issue)
+# DATA
 # ============================================================
 def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
     try:
-        # Use Ticker.history() instead of yf.download() to prevent data bleeding
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval, auto_adjust=False)
         
@@ -260,7 +258,6 @@ def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
         df.columns = ["open", "high", "low", "close", "volume"]
         df = df.astype(float)
         
-        # Drop the forming 15m candle
         if not df.empty:
             df = df.iloc[:-1]
         return df
@@ -561,7 +558,7 @@ def update_open_signals():
             cur.execute("""
                 SELECT id, symbol, direction, stop_loss, take_profit,
                        risk_cents, signal_date, created_at
-                FROM signals WHERE outcome = 'open'
+                FROM public.signals WHERE outcome = 'open'
             """)
             rows = cur.fetchall()
     finally:
@@ -623,7 +620,7 @@ def update_open_signals():
         with conn.cursor() as cur:
             for sid, outcome, exit_price, closed_at, pnl in updates:
                 cur.execute("""
-                    UPDATE signals
+                    UPDATE public.signals
                     SET outcome=%s, exit_price=%s, closed_at=%s, pnl_cents=%s
                     WHERE id=%s
                 """, (outcome, exit_price, closed_at, pnl, sid))
@@ -700,8 +697,9 @@ def run_scan():
                 db_insert_diagnostic(run_id, pair, diag)
 
                 if signal is None:
-                    reasons = ",".join(diag["reasons"]) or "unknown"
-                    print(f"[NONE] {pair}: zones={diag['zones']} sr={diag['sr']} pools={diag['pools']} | {reasons}")
+                    # Deduplicate reasons for console output
+                    unique_reasons = ",".join(sorted(set(diag["reasons"]))) or "unknown"
+                    print(f"[NONE] {pair}: zones={diag['zones']} sr={diag['sr']} pools={diag['pools']} | {unique_reasons}")
                 else:
                     if db_has_open_signal(signal["symbol"], signal["direction"]):
                         print(f"[OPEN] {pair} {signal['direction']}: already open, skipping")
@@ -748,7 +746,7 @@ def run_scan():
                      "stop": s["stop"], "target": s["target"]}
                     if s else None
                 ),
-                "reasons": d.get("reasons", []),
+                "reasons": list(set(d.get("reasons", []))), # Deduplicate for Telegram
                 "zones": d.get("zones", 0),
             }
             for p, s, d in per_pair
