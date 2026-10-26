@@ -101,9 +101,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        last_run = await _fetchone("SELECT started_at, signals_sent, errors FROM public.runs ORDER BY id DESC LIMIT 1")
-        total_row = await _fetchone("SELECT COUNT(*) AS n FROM public.signals")
-        open_row = await _fetchone("SELECT COUNT(*) AS n FROM public.signals WHERE outcome = 'open'")
+        last_run = await _fetchone("SELECT started_at, signals_sent, errors FROM runs ORDER BY id DESC LIMIT 1")
+        total_row = await _fetchone("SELECT COUNT(*) AS n FROM signals")
+        open_row = await _fetchone("SELECT COUNT(*) AS n FROM signals WHERE outcome = 'open'")
         
         total_signals = total_row["n"] if total_row else 0
         open_signals = open_row["n"] if open_row else 0
@@ -131,7 +131,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        rows = await _fetchall("SELECT created_at, symbol, direction, entry, stop_loss, take_profit, lot_size, outcome FROM public.signals ORDER BY id DESC LIMIT 5")
+        rows = await _fetchall("SELECT created_at, symbol, direction, entry, stop_loss, take_profit, lot_size, outcome FROM signals ORDER BY id DESC LIMIT 5")
         if not rows:
             return await _send_with_fallback(update, "📭 *No signals yet*")
         
@@ -149,7 +149,7 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        r = await _fetchone("SELECT * FROM public.signals ORDER BY id DESC LIMIT 1")
+        r = await _fetchone("SELECT * FROM signals ORDER BY id DESC LIMIT 1")
         if not r:
             return await _send_with_fallback(update, "📭 *No signals yet*")
         
@@ -227,11 +227,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        last_run = await _fetchone("SELECT id FROM public.runs ORDER BY id DESC LIMIT 1")
+        last_run = await _fetchone("SELECT id FROM runs ORDER BY id DESC LIMIT 1")
         if not last_run:
             return await _send_with_fallback(update, "📭 *No runs yet*")
         run_id = last_run["id"]
-        rows = await _fetchall("SELECT symbol, zones, sr_levels, pools, reasons FROM public.pair_diagnostics WHERE run_id = %s ORDER BY symbol", (run_id,))
+        rows = await _fetchall("SELECT symbol, zones, sr_levels, pools, reasons FROM pair_diagnostics WHERE run_id = %s ORDER BY symbol", (run_id,))
         if not rows:
             return await _send_with_fallback(update, "📭 *No diagnostics.*")
             
@@ -251,7 +251,7 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
               SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins,
               SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
               COALESCE(SUM(pnl_cents), 0) AS pnl
-            FROM public.signals
+            FROM signals
         """)
         if not totals or totals["total"] == 0:
             return await _send_with_fallback(update, "📭 *No signals yet*")
