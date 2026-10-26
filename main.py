@@ -77,13 +77,12 @@ PAIRS = [
 ]
 
 # ============================================================
-# DATABASE (Explicitly using public schema)
+# DATABASE
 # ============================================================
 def db_connect():
     for attempt in range(3):
         try:
-            # FIX: Pass options to force the search_path at connection startup
-            conn = psycopg2.connect(DATABASE_URL, options="-c search_path=public")
+            conn = psycopg2.connect(DATABASE_URL)
             conn.autocommit = False
             return conn
         except psycopg2.OperationalError:
@@ -95,7 +94,6 @@ def db_init():
     conn = db_connect()
     try:
         with conn.cursor() as cur:
-            # FIX: Explicitly prefix tables with public.
             cur.execute("""
             CREATE TABLE IF NOT EXISTS public.signals (
                 id              SERIAL PRIMARY KEY,
@@ -183,7 +181,7 @@ def db_insert_diagnostic(run_id, symbol, diag):
                     (run_id, symbol, zones, sr_levels, pools, reasons)
                 VALUES (%s, %s, %s, %s, %s, %s)
             """, (run_id, symbol, diag["zones"], diag["sr"], diag["pools"],
-                  ",".join(sorted(set(diag["reasons"]))))) # FIX: Deduplicate reasons
+                  ",".join(sorted(set(diag["reasons"]))))) # Deduplicate reasons
         conn.commit()
     finally:
         conn.close()
@@ -697,7 +695,6 @@ def run_scan():
                 db_insert_diagnostic(run_id, pair, diag)
 
                 if signal is None:
-                    # Deduplicate reasons for console output
                     unique_reasons = ",".join(sorted(set(diag["reasons"]))) or "unknown"
                     print(f"[NONE] {pair}: zones={diag['zones']} sr={diag['sr']} pools={diag['pools']} | {unique_reasons}")
                 else:
@@ -746,7 +743,7 @@ def run_scan():
                      "stop": s["stop"], "target": s["target"]}
                     if s else None
                 ),
-                "reasons": list(set(d.get("reasons", []))), # Deduplicate for Telegram
+                "reasons": list(set(d.get("reasons", []))), 
                 "zones": d.get("zones", 0),
             }
             for p, s, d in per_pair
