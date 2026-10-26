@@ -1,34 +1,18 @@
 """
 Forex Supply/Demand + Liquidity Trading Bot
-- SURVIVAL SCALPING EDITION
-- 15-Minute Timeframe, 1:2 RR
-- Max 3 trades per day circuit breaker
-- Strict 1% risk model for small accounts
-- Postgres (Neon) persistence
+- SURVIVAL SCALPING EDITION (15-Minute)
 """
 
-# ============================================================
-# WARNING SUPPRESSION
-# ============================================================
 import warnings
 warnings.filterwarnings("ignore")
-
 import logging
 logging.disable(logging.WARNING)
 
-for _logger_name in ("yfinance", "peewee", "urllib3", "requests",
-                     "charset_normalizer", "httpx", "httpcore"):
+for _logger_name in ("yfinance", "peewee", "urllib3", "requests", "charset_normalizer"):
     _lg = logging.getLogger(_logger_name)
     _lg.setLevel(logging.CRITICAL)
     _lg.propagate = False
     _lg.handlers.clear()
-
-try:
-    from pandas.errors import Pandas4Warning as _P4W
-    warnings.simplefilter("ignore", _P4W)
-    warnings.filterwarnings("ignore", category=_P4W)
-except Exception:
-    pass
 
 import os
 import sys
@@ -58,52 +42,51 @@ DATABASE_URL     = os.getenv("DATABASE_URL")
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL must be set (Neon Postgres connection string).")
+    raise RuntimeError("DATABASE_URL must be set.")
 
 # ============================================================
 # CONFIG — SURVIVAL SCALPING MODE (15-Minute Timeframe)
 # ============================================================
-# Assuming a Weltrade Cent account ($300 display = $3 real)
 ACCOUNT_BALANCE    = 300.0    
-RISK_PERCENT       = 1.0      # 1% risk = 3 cents real risk per trade
-MAX_RISK_PERCENT   = 1.5      # Hard ceiling
+RISK_PERCENT       = 1.0      
+MAX_RISK_PERCENT   = 1.5      
 BROKER_MIN_LOT     = 0.01
-PIP_VALUE_STANDARD = 0.10     # For cent accounts
-SPREAD_BUFFER_PIPS = 1.5      # Tighter buffer for scalping
+PIP_VALUE_STANDARD = 0.10     
+SPREAD_BUFFER_PIPS = 1.5      
 
 ATR_PERIOD        = 14
 ATR_BUFFER_MULT   = 0.2       
 MIN_STOP_ATR_MULT = 0.5       
 MAX_STOP_ATR_MULT = 1.5       
 
-RR_RATIO           = 2.0      # 1:2 RR (Scalping rarely reaches 1:3)
+RR_RATIO           = 2.0      
 RETEST_BUFFER_PIPS = 1.5      
 SR_TOLERANCE_PIPS  = 3.0      
-ZONE_BODY_MULT     = 1.5      # Stricter impulse requirement for 15m
+ZONE_BODY_MULT     = 1.5      
 
-ZONE_LOOKBACK_BARS = 100      # Look back ~1 day of 15m candles
+ZONE_LOOKBACK_BARS = 100      
 FRESH_ZONES_ONLY   = False
-MAX_DAILY_TRADES   = 3        # Stop trading after 3 signals in a day
+MAX_DAILY_TRADES   = 3        
 
-# Data Settings
-INTERVAL = "15m"              # 15-minute timeframe
+INTERVAL = "15m"              
 PERIOD   = "30d"              
 
-# 7 MAJORS ONLY (Lowest spreads, highest liquidity)
 PAIRS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
     "AUDUSD=X", "USDCAD=X", "NZDUSD=X"
 ]
 
 # ============================================================
-# DATABASE (Postgres via Neon)
+# DATABASE
 # ============================================================
 def db_connect():
-    """Open a Postgres connection with retry logic for Neon cold-starts."""
     for attempt in range(3):
         try:
             conn = psycopg2.connect(DATABASE_URL)
             conn.autocommit = False
+            with conn.cursor() as cur:
+                # FIX: Force Neon to use the public schema
+                cur.execute("SET search_path TO public;")
             return conn
         except psycopg2.OperationalError:
             if attempt == 2:
@@ -252,7 +235,6 @@ def db_get_todays_signal_count():
     conn = db_connect()
     try:
         with conn.cursor() as cur:
-            # Count signals created today (using text date comparison)
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             cur.execute("""
                 SELECT COUNT(*) FROM signals 
@@ -263,22 +245,28 @@ def db_get_todays_signal_count():
         conn.close()
 
 # ============================================================
-# DATA + INDICATORS
+# DATA (Fixed YFinance Caching Issue)
 # ============================================================
 def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
-    df = yf.download(symbol, interval=interval, period=period,
-                     progress=False, auto_adjust=False)
-    if df.empty:
+    try:
+        # FIX: Use Ticker.history() instead of yf.download() to prevent data bleeding between pairs
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=interval, auto_adjust=False)
+        
+        if df.empty:
+            return pd.DataFrame()
+            
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.columns = ["open", "high", "low", "close", "volume"]
+        df = df.astype(float)
+        
+        # Drop the forming 15m candle
+        if not df.empty:
+            df = df.iloc[:-1]
+        return df
+    except Exception as e:
+        print(f"[DATA ERROR] {symbol}: {e}")
         return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    df.columns = ["open", "high", "low", "close", "volume"]
-
-    # Always drop the last row because the current intraday candle is still forming
-    if not df.empty:
-        df = df.iloc[:-1]
-    return df
 
 def calculate_atr(df, period=ATR_PERIOD):
     high, low, close = df["high"], df["low"], df["close"]
@@ -389,9 +377,6 @@ def find_support_resistance(df, window=10):
             sr.append({"type": "support", "level": level})
     return sr
 
-# ============================================================
-# RETEST
-# ============================================================
 def touched_demand(zone, last_low, last_close, buffer_pips, pip):
     zlow, zhigh = zone["bottom"], zone["top"]
     buf = buffer_pips * pip
@@ -428,112 +413,121 @@ def touched_supply(zone, last_high, last_close, buffer_pips, pip):
 def generate_signal(df, symbol):
     diag = {"zones": 0, "sr": 0, "pools": 0, "reasons": []}
 
-    if len(df) < 60:
-        diag["reasons"].append("insufficient_data")
+    try:
+        if len(df) < 60:
+            diag["reasons"].append("insufficient_data")
+            return None, diag
+        
+        atr = calculate_atr(df).iloc[-1]
+        if pd.isna(atr) or atr <= 0:
+            diag["reasons"].append("no_atr")
+            return None, diag
+
+        zones = find_supply_demand_zones(df)
+        pools = find_liquidity_pools(df)
+        sr = find_support_resistance(df)
+
+        diag["zones"] = len(zones)
+        diag["sr"] = len(sr)
+        diag["pools"] = len(pools)
+
+        if not zones:
+            diag["reasons"].append("no_zones")
+            return None, diag
+
+        last_close = df["close"].iloc[-1]
+        last_low = df["low"].iloc[-1]
+        last_high = df["high"].iloc[-1]
+        pip = 0.0001 if last_close < 10 else 0.01
+        spread = SPREAD_BUFFER_PIPS * pip
+        
+        signal_date = pd.Timestamp(df.index[-1]).isoformat() 
+
+        # ---------------- LONG ----------------
+        for zone in zones:
+            if zone["type"] != "demand":
+                continue
+            if not touched_demand(zone, last_low, last_close, RETEST_BUFFER_PIPS, pip):
+                diag["reasons"].append("long_no_retest")
+                continue
+            if not any(abs(s["level"] - zone["bottom"]) <= SR_TOLERANCE_PIPS * pip
+                       for s in sr if s["type"] == "support"):
+                diag["reasons"].append("long_no_support")
+                continue
+            if any(p["type"] == "equal_lows"
+                   and zone["bottom"] - 10 * pip <= p["level"] <= zone["bottom"]
+                   for p in pools):
+                diag["reasons"].append("long_liquidity_trap")
+                continue
+
+            entry = last_close
+            zone_dist = max(entry - zone["bottom"], 0.0)
+            raw_dist = zone_dist + ATR_BUFFER_MULT * atr
+            stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
+            if stop_dist > MAX_STOP_ATR_MULT * atr:
+                diag["reasons"].append("long_stop_too_wide")
+                continue
+
+            return {
+                "symbol": symbol.replace("=X", ""), "direction": "LONG",
+                "signal_date": signal_date,
+                "entry": round(entry, 5),
+                "stop": round(entry - stop_dist, 5),
+                "target": round(entry + (RR_RATIO * stop_dist), 5),
+                "risk_pips": round(stop_dist / pip, 1),
+                "atr_pips": round(atr / pip, 1),
+                "atr_multiple": round(stop_dist / atr, 2),
+                "zone": zone,
+            }, diag
+
+        # ---------------- SHORT ----------------
+        for zone in zones:
+            if zone["type"] != "supply":
+                continue
+            if not touched_supply(zone, last_high, last_close, RETEST_BUFFER_PIPS, pip):
+                diag["reasons"].append("short_no_retest")
+                continue
+            if not any(abs(s["level"] - zone["top"]) <= SR_TOLERANCE_PIPS * pip
+                       for s in sr if s["type"] == "resistance"):
+                diag["reasons"].append("short_no_resistance")
+                continue
+            if any(p["type"] == "equal_highs"
+                   and zone["top"] <= p["level"] <= zone["top"] + 10 * pip
+                   for p in pools):
+                diag["reasons"].append("short_liquidity_trap")
+                continue
+
+            entry = last_close
+            zone_dist = max(zone["top"] - entry, 0.0)
+            raw_dist = zone_dist + ATR_BUFFER_MULT * atr
+            stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
+            if stop_dist > MAX_STOP_ATR_MULT * atr:
+                diag["reasons"].append("short_stop_too_wide")
+                continue
+
+            return {
+                "symbol": symbol.replace("=X", ""), "direction": "SHORT",
+                "signal_date": signal_date,
+                "entry": round(entry, 5),
+                "stop": round(entry + stop_dist, 5),
+                "target": round(entry - (RR_RATIO * stop_dist), 5),
+                "risk_pips": round(stop_dist / pip, 1),
+                "atr_pips": round(atr / pip, 1),
+                "atr_multiple": round(stop_dist / atr, 2),
+                "zone": zone,
+            }, diag
+
+        if not diag["reasons"]:
+            diag["reasons"].append("no_matching_direction")
         return None, diag
-    atr = calculate_atr(df).iloc[-1]
-    if pd.isna(atr) or atr <= 0:
-        diag["reasons"].append("no_atr")
+
+    except ValueError as e:
+        # FIX: Catch pandas ValueError so it doesn't crash the scan
+        diag["reasons"].append("error ValueError")
         return None, diag
-
-    zones = find_supply_demand_zones(df)
-    pools = find_liquidity_pools(df)
-    sr = find_support_resistance(df)
-
-    diag["zones"] = len(zones)
-    diag["sr"] = len(sr)
-    diag["pools"] = len(pools)
-
-    if not zones:
-        diag["reasons"].append("no_zones")
+    except Exception as e:
+        diag["reasons"].append(f"error {type(e).__name__}")
         return None, diag
-
-    last_close = df["close"].iloc[-1]
-    last_low = df["low"].iloc[-1]
-    last_high = df["high"].iloc[-1]
-    pip = 0.0001 if last_close < 10 else 0.01
-    spread = SPREAD_BUFFER_PIPS * pip
-    
-    # Save exact time so multiple 15m signals aren't blocked by duplicate checks
-    signal_date = pd.Timestamp(df.index[-1]).isoformat() 
-
-    # ---------------- LONG ----------------
-    for zone in zones:
-        if zone["type"] != "demand":
-            continue
-        if not touched_demand(zone, last_low, last_close, RETEST_BUFFER_PIPS, pip):
-            diag["reasons"].append("long_no_retest")
-            continue
-        if not any(abs(s["level"] - zone["bottom"]) <= SR_TOLERANCE_PIPS * pip
-                   for s in sr if s["type"] == "support"):
-            diag["reasons"].append("long_no_support")
-            continue
-        if any(p["type"] == "equal_lows"
-               and zone["bottom"] - 10 * pip <= p["level"] <= zone["bottom"]
-               for p in pools):
-            diag["reasons"].append("long_liquidity_trap")
-            continue
-
-        entry = last_close
-        zone_dist = max(entry - zone["bottom"], 0.0)
-        raw_dist = zone_dist + ATR_BUFFER_MULT * atr
-        stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
-        if stop_dist > MAX_STOP_ATR_MULT * atr:
-            diag["reasons"].append("long_stop_too_wide")
-            continue
-
-        return {
-            "symbol": symbol.replace("=X", ""), "direction": "LONG",
-            "signal_date": signal_date,
-            "entry": round(entry, 5),
-            "stop": round(entry - stop_dist, 5),
-            "target": round(entry + (RR_RATIO * stop_dist), 5),
-            "risk_pips": round(stop_dist / pip, 1),
-            "atr_pips": round(atr / pip, 1),
-            "atr_multiple": round(stop_dist / atr, 2),
-            "zone": zone,
-        }, diag
-
-    # ---------------- SHORT ----------------
-    for zone in zones:
-        if zone["type"] != "supply":
-            continue
-        if not touched_supply(zone, last_high, last_close, RETEST_BUFFER_PIPS, pip):
-            diag["reasons"].append("short_no_retest")
-            continue
-        if not any(abs(s["level"] - zone["top"]) <= SR_TOLERANCE_PIPS * pip
-                   for s in sr if s["type"] == "resistance"):
-            diag["reasons"].append("short_no_resistance")
-            continue
-        if any(p["type"] == "equal_highs"
-               and zone["top"] <= p["level"] <= zone["top"] + 10 * pip
-               for p in pools):
-            diag["reasons"].append("short_liquidity_trap")
-            continue
-
-        entry = last_close
-        zone_dist = max(zone["top"] - entry, 0.0)
-        raw_dist = zone_dist + ATR_BUFFER_MULT * atr
-        stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
-        if stop_dist > MAX_STOP_ATR_MULT * atr:
-            diag["reasons"].append("short_stop_too_wide")
-            continue
-
-        return {
-            "symbol": symbol.replace("=X", ""), "direction": "SHORT",
-            "signal_date": signal_date,
-            "entry": round(entry, 5),
-            "stop": round(entry + stop_dist, 5),
-            "target": round(entry - (RR_RATIO * stop_dist), 5),
-            "risk_pips": round(stop_dist / pip, 1),
-            "atr_pips": round(atr / pip, 1),
-            "atr_multiple": round(stop_dist / atr, 2),
-            "zone": zone,
-        }, diag
-
-    if not diag["reasons"]:
-        diag["reasons"].append("no_matching_direction")
-    return None, diag
 
 # ============================================================
 # POSITION SIZING
@@ -559,7 +553,7 @@ def calculate_lot_size(stop_pips):
     return lots, risk, src
 
 # ============================================================
-# OUTCOME TRACKING (Intraday)
+# OUTCOME TRACKING
 # ============================================================
 def update_open_signals():
     conn = db_connect()
@@ -582,7 +576,6 @@ def update_open_signals():
         sym = r["symbol"]
         if sym not in cache:
             try:
-                # Fetch recent 15m data to check outcomes
                 cache[sym] = fetch_data(sym + "=X", interval=INTERVAL, period="5d")
             except Exception:
                 cache[sym] = pd.DataFrame()
@@ -590,25 +583,22 @@ def update_open_signals():
         if df.empty:
             continue
 
-        # For scalping, signal_date is ISO formatted with time
         start_str = r["signal_date"] or r["created_at"]
         try:
             start_date = datetime.fromisoformat(start_str)
         except ValueError:
-            continue # Skip if the date format is broken
+            continue
 
         sl, tp = r["stop_loss"], r["take_profit"]
         is_long = r["direction"] == "LONG"
 
         for ts, bar in df.iterrows():
             bar_date = pd.Timestamp(ts).to_pydatetime()
-            # Only check candles that formed AFTER the signal
-            if bar_date <= start_date:
-                continue
-            
-            # Make timezone aware if the dataframe index is naive
             if bar_date.tzinfo is None:
                 bar_date = bar_date.replace(tzinfo=timezone.utc)
+                
+            if bar_date <= start_date:
+                continue
 
             if is_long:
                 hit_sl = bar["low"] <= sl
@@ -682,88 +672,70 @@ def run_scan():
     except Exception as e:
         print(f"[ERROR] outcome update: {type(e).__name__}: {e}")
 
-    # CIRCUIT BREAKER CHECK (Max 3 trades per day)
     try:
         todays_trades = db_get_todays_signal_count()
         if todays_trades >= MAX_DAILY_TRADES:
             print(f"[LIMIT] Already sent {todays_trades} signals today. Max is {MAX_DAILY_TRADES}. Stopping scan.")
-            return {
-                "run_id": 0, 
-                "pairs_scanned": 0, 
-                "signals_sent": 0, 
-                "signals_skipped": 0, 
-                "errors": 0,
-                "per_pair": []
-            }
+            return {"run_id": 0, "pairs_scanned": 0, "signals_sent": 0, "signals_skipped": 0, "errors": 0, "per_pair": []}
     except Exception as e:
         print(f"[ERROR] circuit breaker check: {e}")
 
     started_at = datetime.now(timezone.utc).isoformat()
     run_id = db_insert_run_start(started_at)
-    print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | "
-          f"TargetRisk={RISK_PERCENT}% | MaxRisk={MAX_RISK_PERCENT}% | "
-          f"run_id={run_id}")
-    print(f"[CFG]   TF={INTERVAL} | RR=1:{RR_RATIO} | "
-          f"ZONE_BODY_MULT={ZONE_BODY_MULT} | "
-          f"RETEST_BUFFER={RETEST_BUFFER_PIPS}")
+    print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | run_id={run_id}")
 
     pairs_scanned = signals_sent = signals_skipped = errors = 0
     per_pair = []
 
     for pair in PAIRS:
+        signal = None
+        diag = {"zones": 0, "sr": 0, "pools": 0, "reasons": []}
+        
         try:
             df = fetch_data(pair)
             if df.empty:
                 print(f"[SKIP] {pair}: no data")
-                db_insert_diagnostic(run_id, pair,
-                                     {"zones": 0, "sr": 0, "pools": 0,
-                                      "reasons": ["no_data"]})
-                per_pair.append((pair, None, {"reasons": ["no_data"],
-                                              "zones": 0, "sr": 0, "pools": 0}))
-                continue
+                diag["reasons"].append("no_data")
+            else:
+                pairs_scanned += 1
+                signal, diag = generate_signal(df, pair)
+                db_insert_diagnostic(run_id, pair, diag)
 
-            pairs_scanned += 1
-            signal, diag = generate_signal(df, pair)
-            db_insert_diagnostic(run_id, pair, diag)
-            per_pair.append((pair, signal, diag))
-
-            if signal is None:
-                reasons = ",".join(diag["reasons"]) or "unknown"
-                print(f"[NONE] {pair}: zones={diag['zones']} sr={diag['sr']} "
-                      f"pools={diag['pools']} | {reasons}")
-                continue
-
-            if db_has_open_signal(signal["symbol"], signal["direction"]):
-                print(f"[OPEN] {pair} {signal['direction']}: already open, skipping")
-                continue
-
-            lots, risk_cents, source = calculate_lot_size(signal["risk_pips"])
-            if lots == 0.0:
-                signals_skipped += 1
-                print(f"[SKIP] {pair} {signal['direction']}: {source} "
-                      f"(stop={signal['risk_pips']} pips)")
-                continue
-
-            inserted = db_insert_signal(signal, lots, risk_cents, source)
-            if not inserted:
-                print(f"[DUP] {pair} {signal['direction']}: already sent")
-                continue
-
-            print(f"[SIGNAL] {pair} {signal['direction']} | lots={lots} | "
-                  f"risk={risk_cents:.1f}¢ | source={source}")
-            asyncio.run(send_telegram(signal, lots, risk_cents, source))
-            signals_sent += 1
+                if signal is None:
+                    reasons = ",".join(diag["reasons"]) or "unknown"
+                    print(f"[NONE] {pair}: zones={diag['zones']} sr={diag['sr']} pools={diag['pools']} | {reasons}")
+                else:
+                    if db_has_open_signal(signal["symbol"], signal["direction"]):
+                        print(f"[OPEN] {pair} {signal['direction']}: already open, skipping")
+                        signal = None
+                    else:
+                        lots, risk_cents, source = calculate_lot_size(signal["risk_pips"])
+                        if lots == 0.0:
+                            signals_skipped += 1
+                            print(f"[SKIP] {pair} {signal['direction']}: {source} (stop={signal['risk_pips']} pips)")
+                            signal = None
+                        else:
+                            inserted = db_insert_signal(signal, lots, risk_cents, source)
+                            if not inserted:
+                                print(f"[DUP] {pair} {signal['direction']}: already sent")
+                                signal = None
+                            else:
+                                print(f"[SIGNAL] {pair} {signal['direction']} | lots={lots} | risk={risk_cents:.1f}¢")
+                                asyncio.run(send_telegram(signal, lots, risk_cents, source))
+                                signals_sent += 1
 
         except Exception as e:
             errors += 1
             print(f"[ERROR] {pair}: {type(e).__name__}: {e}")
-            per_pair.append((pair, None,
-                             {"reasons": [f"error {type(e).__name__}"],
-                              "zones": 0, "sr": 0, "pools": 0}))
+            diag["reasons"].append(f"error {type(e).__name__}")
+            signal = None
+        
+        finally:
+            # FIX: Only append to per_pair ONCE per pair, at the end of the loop
+            per_pair.append((pair, signal, diag))
 
     db_finish_run(run_id, pairs_scanned, signals_sent, signals_skipped, errors)
-    print(f"[DONE] {signals_sent} signal(s) sent | "
-          f"{signals_skipped} skipped | {errors} errors | run_id={run_id}")
+    print(f"[DONE] {signals_sent} sent | {signals_skipped} skipped | {errors} errors | run_id={run_id}")
 
     return {
         "run_id": run_id,
@@ -786,8 +758,5 @@ def run_scan():
         ],
     }
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
 if __name__ == "__main__":
     run_scan()
