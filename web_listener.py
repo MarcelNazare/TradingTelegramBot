@@ -81,7 +81,7 @@ def index():
 
 @app.route("/health")
 def health():
-    return "ok", 200
+    return jsonify({"status": "ok"}), 200
 
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
@@ -96,11 +96,11 @@ def webhook():
             future = asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), _loop)
             future.result(timeout=20)
 
-        return "ok", 200
+        return jsonify({"status": "ok"}), 200
     except Exception as e:
         print(f"[WEBHOOK ERROR] {type(e).__name__}: {e}")
         traceback.print_exc()
-        return "error", 500
+        return jsonify({"status": "error"}), 200
 
 @app.route("/run-scan", methods=["GET"])
 def run_scan():
@@ -138,7 +138,7 @@ def run_scan():
     # 2. Start the background task
     threading.Thread(target=_background_scan).start()
 
-    # 3. Return IMMEDIATELY to cron-job.org with a tiny response
+    # 3. Return IMMEDIATELY to cron-job.org with a tiny JSON response
     return jsonify({"status": "accepted", "message": "Scan started"}), 200
 
 @app.route("/dashboard")
