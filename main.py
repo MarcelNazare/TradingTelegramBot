@@ -60,7 +60,7 @@ MIN_STOP_ATR_MULT = 0.5
 MAX_STOP_ATR_MULT = 1.5       
 
 RR_RATIO           = 2.0      
-RETEST_BUFFER_PIPS = 1.5      
+RETEST_BUFFER_PIPS = 3.0      # UPDATED: Widened from 1.5 to 3.0
 SR_TOLERANCE_PIPS  = 3.0      
 ZONE_BODY_MULT     = 1.5      
 
@@ -181,7 +181,7 @@ def db_insert_diagnostic(run_id, symbol, diag):
                     (run_id, symbol, zones, sr_levels, pools, reasons)
                 VALUES (%s, %s, %s, %s, %s, %s)
             """, (run_id, symbol, diag["zones"], diag["sr"], diag["pools"],
-                  ",".join(sorted(set(diag["reasons"]))))) # Deduplicate reasons
+                  ",".join(sorted(set(diag["reasons"])))))
         conn.commit()
     finally:
         conn.close()
@@ -431,8 +431,6 @@ def generate_signal(df, symbol):
             return None, diag
 
         last_close = df["close"].iloc[-1]
-        last_low = df["low"].iloc[-1]
-        last_high = df["high"].iloc[-1]
         pip = 0.0001 if last_close < 10 else 0.01
         spread = SPREAD_BUFFER_PIPS * pip
         
@@ -442,9 +440,18 @@ def generate_signal(df, symbol):
         for zone in zones:
             if zone["type"] != "demand":
                 continue
-            if not touched_demand(zone, last_low, last_close, RETEST_BUFFER_PIPS, pip):
+                
+            # Check last 3 candles for retest
+            retest_hit = False
+            for i in range(1, 4):
+                if touched_demand(zone, df["low"].iloc[-i], df["close"].iloc[-i], RETEST_BUFFER_PIPS, pip):
+                    retest_hit = True
+                    break
+            
+            if not retest_hit:
                 diag["reasons"].append("long_no_retest")
                 continue
+                
             if not any(abs(s["level"] - zone["bottom"]) <= SR_TOLERANCE_PIPS * pip
                        for s in sr if s["type"] == "support"):
                 diag["reasons"].append("long_no_support")
@@ -479,9 +486,18 @@ def generate_signal(df, symbol):
         for zone in zones:
             if zone["type"] != "supply":
                 continue
-            if not touched_supply(zone, last_high, last_close, RETEST_BUFFER_PIPS, pip):
+                
+            # Check last 3 candles for retest
+            retest_hit = False
+            for i in range(1, 4):
+                if touched_supply(zone, df["high"].iloc[-i], df["close"].iloc[-i], RETEST_BUFFER_PIPS, pip):
+                    retest_hit = True
+                    break
+                    
+            if not retest_hit:
                 diag["reasons"].append("short_no_retest")
                 continue
+                
             if not any(abs(s["level"] - zone["top"]) <= SR_TOLERANCE_PIPS * pip
                        for s in sr if s["type"] == "resistance"):
                 diag["reasons"].append("short_no_resistance")
