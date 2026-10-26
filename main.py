@@ -1,23 +1,14 @@
 """
 Forex Supply/Demand + Liquidity Trading Bot
-- Weltrade Micro (Cent) account edition
-- 1:3 RR, ATR-adaptive stops, dynamic 5%/10% risk
-- Daily timeframe, majors + selective crosses
-- Postgres (Neon) persistence — signals, runs, pair_diagnostics
-- Full Telegram command interface (13 commands)
-
-Run modes:
-    python main.py            -> scan once and exit
-    python main.py --listen   -> (handled by web_listener.py on Render)
-
-Requires env vars:
-    TELEGRAM_TOKEN
-    TELEGRAM_CHAT_ID
-    DATABASE_URL  (Postgres connection string, e.g. from neon.tech)
+- SURVIVAL SCALPING EDITION
+- 15-Minute Timeframe, 1:2 RR
+- Max 3 trades per day circuit breaker
+- Strict 1% risk model for small accounts
+- Postgres (Neon) persistence
 """
 
 # ============================================================
-# WARNING SUPPRESSION — MUST BE FIRST EXECUTABLE CODE
+# WARNING SUPPRESSION
 # ============================================================
 import warnings
 warnings.filterwarnings("ignore")
@@ -70,33 +61,38 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be set (Neon Postgres connection string).")
 
 # ============================================================
-# CONFIG
+# CONFIG — SURVIVAL SCALPING MODE (15-Minute Timeframe)
 # ============================================================
-ACCOUNT_BALANCE    = 300.0
-RISK_PERCENT       = 5.0
-MAX_RISK_PERCENT   = 10.0
+# Assuming a Weltrade Cent account ($300 display = $3 real)
+ACCOUNT_BALANCE    = 300.0    
+RISK_PERCENT       = 1.0      # 1% risk = 3 cents real risk per trade
+MAX_RISK_PERCENT   = 1.5      # Hard ceiling
 BROKER_MIN_LOT     = 0.01
-PIP_VALUE_STANDARD = 0.10
-SPREAD_BUFFER_PIPS = 2.0
+PIP_VALUE_STANDARD = 0.10     # For cent accounts
+SPREAD_BUFFER_PIPS = 1.5      # Tighter buffer for scalping
 
 ATR_PERIOD        = 14
-ATR_BUFFER_MULT   = 0.3
-MIN_STOP_ATR_MULT = 1.0
-MAX_STOP_ATR_MULT = 3.0
+ATR_BUFFER_MULT   = 0.2       
+MIN_STOP_ATR_MULT = 0.5       
+MAX_STOP_ATR_MULT = 1.5       
 
-RETEST_BUFFER_PIPS = 5.0
-SR_TOLERANCE_PIPS  = 10.0
-ZONE_BODY_MULT     = 1.2
+RR_RATIO           = 2.0      # 1:2 RR (Scalping rarely reaches 1:3)
+RETEST_BUFFER_PIPS = 1.5      
+SR_TOLERANCE_PIPS  = 3.0      
+ZONE_BODY_MULT     = 1.5      # Stricter impulse requirement for 15m
 
-ZONE_LOOKBACK_BARS = 50
+ZONE_LOOKBACK_BARS = 100      # Look back ~1 day of 15m candles
 FRESH_ZONES_ONLY   = False
+MAX_DAILY_TRADES   = 3        # Stop trading after 3 signals in a day
 
-DAILY_CLOSE_UTC_HOUR = 22
+# Data Settings
+INTERVAL = "15m"              # 15-minute timeframe
+PERIOD   = "30d"              
 
+# 7 MAJORS ONLY (Lowest spreads, highest liquidity)
 PAIRS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
-    "AUDUSD=X", "USDCAD=X", "NZDUSD=X",
-    "EURGBP=X", "EURJPY=X", "GBPJPY=X", "AUDJPY=X",
+    "AUDUSD=X", "USDCAD=X", "NZDUSD=X"
 ]
 
 # ============================================================
@@ -142,20 +138,10 @@ def db_init():
                 closed_at       TEXT,
                 pnl_cents       DOUBLE PRECISION
             );
-            """)
-            cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_signals_created
-                ON signals(created_at);
-            """)
-            cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_signals_symbol
-                ON signals(symbol, created_at);
-            """)
-            cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique
-                ON signals(symbol, direction, signal_date);
-            """)
-            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);
+            CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique ON signals(symbol, direction, signal_date);
+
             CREATE TABLE IF NOT EXISTS runs (
                 id              SERIAL PRIMARY KEY,
                 started_at      TEXT NOT NULL,
@@ -165,8 +151,7 @@ def db_init():
                 signals_skipped INTEGER DEFAULT 0,
                 errors          INTEGER DEFAULT 0
             );
-            """)
-            cur.execute("""
+
             CREATE TABLE IF NOT EXISTS pair_diagnostics (
                 id          SERIAL PRIMARY KEY,
                 run_id      INTEGER NOT NULL REFERENCES runs(id),
@@ -176,10 +161,7 @@ def db_init():
                 pools       INTEGER,
                 reasons     TEXT
             );
-            """)
-            cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_diag_run
-                ON pair_diagnostics(run_id);
+            CREATE INDEX IF NOT EXISTS idx_diag_run ON pair_diagnostics(run_id);
             """)
         conn.commit()
     finally:
@@ -189,10 +171,7 @@ def db_insert_run_start(started_at):
     conn = db_connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO runs (started_at) VALUES (%s) RETURNING id",
-                (started_at,)
-            )
+            cur.execute("INSERT INTO runs (started_at) VALUES (%s) RETURNING id", (started_at,))
             run_id = cur.fetchone()[0]
         conn.commit()
         return run_id
@@ -269,10 +248,24 @@ def db_has_open_signal(symbol, direction):
     finally:
         conn.close()
 
+def db_get_todays_signal_count():
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            # Count signals created today (using text date comparison)
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            cur.execute("""
+                SELECT COUNT(*) FROM signals 
+                WHERE created_at LIKE %s
+            """, (f"{today_str}%",))
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
 # ============================================================
 # DATA + INDICATORS
 # ============================================================
-def fetch_data(symbol, interval="1d", period="6mo", drop_forming=True):
+def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
     df = yf.download(symbol, interval=interval, period=period,
                      progress=False, auto_adjust=False)
     if df.empty:
@@ -282,11 +275,9 @@ def fetch_data(symbol, interval="1d", period="6mo", drop_forming=True):
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     df.columns = ["open", "high", "low", "close", "volume"]
 
-    if drop_forming and interval == "1d" and not df.empty:
-        now = datetime.now(timezone.utc)
-        last_date = pd.Timestamp(df.index[-1]).date()
-        if last_date >= now.date() and now.hour < DAILY_CLOSE_UTC_HOUR:
-            df = df.iloc[:-1]
+    # Always drop the last row because the current intraday candle is still forming
+    if not df.empty:
+        df = df.iloc[:-1]
     return df
 
 def calculate_atr(df, period=ATR_PERIOD):
@@ -462,7 +453,9 @@ def generate_signal(df, symbol):
     last_high = df["high"].iloc[-1]
     pip = 0.0001 if last_close < 10 else 0.01
     spread = SPREAD_BUFFER_PIPS * pip
-    signal_date = pd.Timestamp(df.index[-1]).date().isoformat()
+    
+    # Save exact time so multiple 15m signals aren't blocked by duplicate checks
+    signal_date = pd.Timestamp(df.index[-1]).isoformat() 
 
     # ---------------- LONG ----------------
     for zone in zones:
@@ -494,7 +487,7 @@ def generate_signal(df, symbol):
             "signal_date": signal_date,
             "entry": round(entry, 5),
             "stop": round(entry - stop_dist, 5),
-            "target": round(entry + 3 * stop_dist, 5),
+            "target": round(entry + (RR_RATIO * stop_dist), 5),
             "risk_pips": round(stop_dist / pip, 1),
             "atr_pips": round(atr / pip, 1),
             "atr_multiple": round(stop_dist / atr, 2),
@@ -531,7 +524,7 @@ def generate_signal(df, symbol):
             "signal_date": signal_date,
             "entry": round(entry, 5),
             "stop": round(entry + stop_dist, 5),
-            "target": round(entry - 3 * stop_dist, 5),
+            "target": round(entry - (RR_RATIO * stop_dist), 5),
             "risk_pips": round(stop_dist / pip, 1),
             "atr_pips": round(atr / pip, 1),
             "atr_multiple": round(stop_dist / atr, 2),
@@ -566,7 +559,7 @@ def calculate_lot_size(stop_pips):
     return lots, risk, src
 
 # ============================================================
-# OUTCOME TRACKING
+# OUTCOME TRACKING (Intraday)
 # ============================================================
 def update_open_signals():
     conn = db_connect()
@@ -589,35 +582,48 @@ def update_open_signals():
         sym = r["symbol"]
         if sym not in cache:
             try:
-                cache[sym] = fetch_data(sym + "=X")
+                # Fetch recent 15m data to check outcomes
+                cache[sym] = fetch_data(sym + "=X", interval=INTERVAL, period="5d")
             except Exception:
                 cache[sym] = pd.DataFrame()
         df = cache[sym]
         if df.empty:
             continue
 
-        start_str = r["signal_date"] or r["created_at"][:10]
-        start_date = datetime.fromisoformat(start_str[:10]).date()
+        # For scalping, signal_date is ISO formatted with time
+        start_str = r["signal_date"] or r["created_at"]
+        try:
+            start_date = datetime.fromisoformat(start_str)
+        except ValueError:
+            continue # Skip if the date format is broken
+
         sl, tp = r["stop_loss"], r["take_profit"]
         is_long = r["direction"] == "LONG"
 
         for ts, bar in df.iterrows():
-            bar_date = pd.Timestamp(ts).date()
+            bar_date = pd.Timestamp(ts).to_pydatetime()
+            # Only check candles that formed AFTER the signal
             if bar_date <= start_date:
                 continue
+            
+            # Make timezone aware if the dataframe index is naive
+            if bar_date.tzinfo is None:
+                bar_date = bar_date.replace(tzinfo=timezone.utc)
+
             if is_long:
                 hit_sl = bar["low"] <= sl
                 hit_tp = bar["high"] >= tp
             else:
                 hit_sl = bar["high"] >= sl
                 hit_tp = bar["low"] <= tp
+                
             if hit_sl:
                 updates.append((r["id"], "loss", sl, bar_date.isoformat(),
                                 -r["risk_cents"]))
                 break
             if hit_tp:
                 updates.append((r["id"], "win", tp, bar_date.isoformat(),
-                                3 * r["risk_cents"]))
+                                (RR_RATIO * r["risk_cents"])))
                 break
 
     if not updates:
@@ -643,20 +649,22 @@ def update_open_signals():
 async def send_telegram(signal, lot_size, risk_cents, source):
     bot = Bot(token=TELEGRAM_TOKEN)
     risk_pct = (risk_cents / ACCOUNT_BALANCE) * 100
+    reward_cents = risk_cents * RR_RATIO
+    
     msg = (
-        f"🚨 *{signal['symbol']} {signal['direction']}*\n"
+        f"⚡️ *{signal['symbol']} {signal['direction']}* (Scalp)\n"
         f"━━━━━━━━━━━━━━\n"
         f"Entry: `{signal['entry']}`\n"
         f"Stop Loss: `{signal['stop']}`\n"
         f"Take Profit: `{signal['target']}`\n"
-        f"Risk: {signal['risk_pips']} pips (1:3 RR)\n"
+        f"Risk: {signal['risk_pips']} pips (1:{int(RR_RATIO)} RR)\n"
         f"ATR({ATR_PERIOD}): {signal['atr_pips']} pips | "
         f"Stop = {signal['atr_multiple']}× ATR\n"
         f"Lot Size: `{lot_size}` ({source})\n"
         f"Risk ≈ {risk_cents:.1f}¢ ({risk_pct:.1f}%)\n"
+        f"Max Win ≈ {reward_cents:.1f}¢\n"
         f"Zone: {signal['zone']['type'].capitalize()} "
         f"({signal['zone']['bottom']:.5f} – {signal['zone']['top']:.5f})\n"
-        f"Candle: {signal['signal_date']}\n"
         f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
@@ -674,22 +682,37 @@ def run_scan():
     except Exception as e:
         print(f"[ERROR] outcome update: {type(e).__name__}: {e}")
 
+    # CIRCUIT BREAKER CHECK (Max 3 trades per day)
+    try:
+        todays_trades = db_get_todays_signal_count()
+        if todays_trades >= MAX_DAILY_TRADES:
+            print(f"[LIMIT] Already sent {todays_trades} signals today. Max is {MAX_DAILY_TRADES}. Stopping scan.")
+            return {
+                "run_id": 0, 
+                "pairs_scanned": 0, 
+                "signals_sent": 0, 
+                "signals_skipped": 0, 
+                "errors": 0,
+                "per_pair": []
+            }
+    except Exception as e:
+        print(f"[ERROR] circuit breaker check: {e}")
+
     started_at = datetime.now(timezone.utc).isoformat()
     run_id = db_insert_run_start(started_at)
     print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | "
           f"TargetRisk={RISK_PERCENT}% | MaxRisk={MAX_RISK_PERCENT}% | "
           f"run_id={run_id}")
-    print(f"[CFG]   ZONE_BODY_MULT={ZONE_BODY_MULT} | "
-          f"RETEST_BUFFER_PIPS={RETEST_BUFFER_PIPS} | "
-          f"SR_TOLERANCE_PIPS={SR_TOLERANCE_PIPS} | "
-          f"FRESH_ZONES_ONLY={FRESH_ZONES_ONLY}")
+    print(f"[CFG]   TF={INTERVAL} | RR=1:{RR_RATIO} | "
+          f"ZONE_BODY_MULT={ZONE_BODY_MULT} | "
+          f"RETEST_BUFFER={RETEST_BUFFER_PIPS}")
 
     pairs_scanned = signals_sent = signals_skipped = errors = 0
     per_pair = []
 
     for pair in PAIRS:
         try:
-            df = fetch_data(pair, interval="1d", period="6mo")
+            df = fetch_data(pair)
             if df.empty:
                 print(f"[SKIP] {pair}: no data")
                 db_insert_diagnostic(run_id, pair,
