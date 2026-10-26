@@ -104,15 +104,12 @@ def webhook():
 
 @app.route("/run-scan", methods=["GET"])
 def run_scan():
-    # 1. Security Check
     if SCAN_SECRET and request.args.get("k") != SCAN_SECRET:
         abort(403)
     
-    # 2. Run the scan
     try:
         result = bot_main.run_scan()
         
-        # 3. Send Telegram Heartbeat (Success)
         msg = (
             f"🤖 *Cron Job Triggered*\n"
             f"━━━━━━━━━━━━━━\n"
@@ -130,7 +127,6 @@ def run_scan():
                 parse_mode="Markdown"
             )
         
-        # Send asynchronously so the HTTP response isn't delayed
         asyncio.run_coroutine_threadsafe(_send_msg(), _loop)
         
         return jsonify({"status": "ok", "result": result}), 200
@@ -138,7 +134,6 @@ def run_scan():
     except Exception as e:
         traceback.print_exc()
         
-        # 4. Send Telegram Heartbeat (Failure)
         err_msg = f"❌ *Scan Failed!*\n\n`{type(e).__name__}: {e}`"
         async def _send_err():
             await telegram_app.bot.send_message(
@@ -156,21 +151,37 @@ def dashboard():
         import psycopg2
         import psycopg2.extras
         
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), options="-c search_path=public")
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         conn.autocommit = True
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT created_at, symbol, direction, entry, stop_loss, take_profit, lot_size, outcome, pnl_cents FROM public.signals ORDER BY id DESC LIMIT 50")
+            # 1. Fetch Recent Signals
+            cur.execute("""
+                SELECT created_at, symbol, direction, entry, stop_loss, 
+                       take_profit, lot_size, outcome, pnl_cents 
+                FROM signals 
+                ORDER BY id DESC LIMIT 50
+            """)
             signals = cur.fetchall()
             
+            # 2. Fetch Aggregate Signal Stats
             cur.execute("""
                 SELECT COUNT(*) AS total,
                     SUM(CASE WHEN outcome = 'open' THEN 1 ELSE 0 END) AS open_n,
                     SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins,
                     SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
                     COALESCE(SUM(pnl_cents), 0) AS pnl
-                FROM public.signals
+                FROM signals
             """)
             totals = cur.fetchone()
+            
+            # 3. Fetch Recent Runs (Cron Jobs)
+            cur.execute("""
+                SELECT id, started_at, pairs_scanned, signals_sent, signals_skipped, errors
+                FROM runs 
+                ORDER BY id DESC LIMIT 20
+            """)
+            runs = cur.fetchall()
+            
         conn.close()
         
         closed = (totals["wins"] or 0) + (totals["losses"] or 0)
@@ -182,7 +193,7 @@ def dashboard():
             "win_rate": win_rate,
             "pnl": round(totals["pnl"], 1)
         }
-        return render_template("dashboard.html", signals=signals, stats=stats)
+        return render_template("dashboard.html", signals=signals, stats=stats, runs=runs)
     except Exception as e:
         return f"Dashboard Error: {e}", 500
 
