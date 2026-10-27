@@ -72,6 +72,12 @@ _register_webhook()
 # ============================================================
 app = Flask(__name__)
 
+# Global error handler to prevent HTML error pages from causing "Response data too big"
+@app.errorhandler(Exception)
+def handle_exception(e):
+    traceback.print_exc()
+    return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route("/")
 def index():
     try:
@@ -98,14 +104,13 @@ def webhook():
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
-        print(f"[WEBHOOK ERROR] {type(e).__name__}: {e}")
         traceback.print_exc()
         return jsonify({"status": "error"}), 200
 
 @app.route("/run-scan", methods=["GET"])
 def run_scan():
     if SCAN_SECRET and request.args.get("k") != SCAN_SECRET:
-        abort(403)
+        return jsonify({"status": "error", "message": "Unauthorized"}), 403
     
     # 1. Define the background task
     def _background_scan():
@@ -138,7 +143,7 @@ def run_scan():
     # 2. Start the background task
     threading.Thread(target=_background_scan).start()
 
-    # 3. Return IMMEDIATELY to cron-job.org with a tiny JSON response
+    # 3. Return IMMEDIATELY with a tiny response
     return jsonify({"status": "accepted", "message": "Scan started"}), 200
 
 @app.route("/dashboard")
