@@ -1,3 +1,8 @@
+"""
+Telegram command handlers for the Forex Signal Bot.
+Postgres (Neon) edition, Async-safe.
+"""
+
 import os
 import asyncio
 import psycopg2
@@ -57,7 +62,7 @@ async def _fetchall(query, params=()):
     return await asyncio.to_thread(_fetchall_sync, query, params)
 
 def _fmt_price(v):
-    return f"{v:.5f}" if v is not None else "—"
+    return f"{v:.2f}" if v is not None else "—"  # Changed to 2 decimals for Gold
 
 def _fmt_cents(v):
     return f"{v:.1f}¢" if v is not None else "—"
@@ -67,9 +72,9 @@ def _now_utc() -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 *Welcome to the Survival Scalp Bot*\n"
+        "👋 *Welcome to the Gold Scalp Bot*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "This bot scans the 7 major pairs on the 1-hour timeframe. "
+        "This bot scans XAUUSD on the 1-hour timeframe. "
         "It only takes LONG trades above the 200 EMA.\n\n"
         "*Quick start:*\n"
         "• /help — commands\n"
@@ -163,8 +168,15 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_with_fallback(update, f"❌ Error: {_md_safe(e)}")
 
 async def cmd_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pairs = [p.replace("=X", "") for p in bot_main.PAIRS]
-    text = "💱 *Monitored Pairs*\n\n" + "\n".join([f"• `{p}`" for p in pairs])
+    # Map ticker names for display
+    pairs = []
+    for p in bot_main.PAIRS:
+        if p == "GC=F":
+            pairs.append("XAUUSD (Gold)")
+        else:
+            pairs.append(p.replace("=X", ""))
+            
+    text = "💱 *Monitored Assets*\n\n" + "\n".join([f"• `{p}`" for p in pairs])
     await _send_with_fallback(update, text)
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +244,7 @@ async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         lines = [f"🔬 *Diagnostics — run_id {run_id}*", "━━━━━━━━━━━━━━━━━━━━", ""]
         for r in rows:
-            sym = r["symbol"].replace("=X", "").ljust(7)
+            sym = r["symbol"].replace("=X", "").replace("GC=F", "XAUUSD").ljust(7)
             reasons = _md_safe(r["reasons"] or "—")[:25]
             lines.append(f"`{sym} z:{r['zones']} s:{r['sr_levels']} p:{r['pools']}` {reasons}")
         await _send_with_fallback(update, "\n".join(lines))
@@ -272,6 +284,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"⚙️ *Current Settings*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Asset: `XAUUSD (Gold)`\n"
         f"Timeframe: `{bot_main.INTERVAL}`\n"
         f"RR Ratio: `1:{bot_main.RR_RATIO}`\n"
         f"ZONE_BODY_MULT: `{bot_main.ZONE_BODY_MULT}`\n"
@@ -285,8 +298,8 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "ℹ️ *About This Bot*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Trend-Following Edition.\n"
-        "1-Hour chart, 7 Major Pairs.\n"
+        "Gold Trend-Following Edition.\n"
+        "1-Hour chart, XAUUSD only.\n"
         "Long-Only above 200 EMA.\n"
         "1:3 Risk/Reward, 1% Account Risk.\n\n"
         "⚠️ *Signals only. Not financial advice.*"
