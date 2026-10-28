@@ -1,5 +1,5 @@
 """
-Forex Supply/Demand + Liquidity Trading Bot
+Gold (XAUUSD) Supply/Demand + Liquidity Trading Bot
 - 1-HOUR TREND-FOLLOWING EDITION
 - LONG ONLY + SLOPING 200 EMA
 """
@@ -46,14 +46,14 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be set.")
 
 # ============================================================
-# CONFIG — 1H TREND-FOLLOWING MODE (LONG ONLY)
+# CONFIG — GOLD (XAUUSD) TREND-FOLLOWING (LONG ONLY)
 # ============================================================
 ACCOUNT_BALANCE    = 300.0    
 RISK_PERCENT       = 1.0      
 MAX_RISK_PERCENT   = 1.5      
 BROKER_MIN_LOT     = 0.01
-PIP_VALUE_STANDARD = 0.10     
-SPREAD_BUFFER_PIPS = 1.5      
+PIP_VALUE_STANDARD = 0.10     # Adjusted for Gold Cent Accounts
+SPREAD_BUFFER_PIPS = 5.0      # Gold spread is wider (~20-30 points = 2-3 pips)
 
 ATR_PERIOD        = 14
 ATR_BUFFER_MULT   = 0.2       
@@ -61,8 +61,8 @@ MIN_STOP_ATR_MULT = 0.5
 MAX_STOP_ATR_MULT = 2.5       
 
 RR_RATIO           = 3.0      
-RETEST_BUFFER_PIPS = 3.0      
-SR_TOLERANCE_PIPS  = 3.0      
+RETEST_BUFFER_PIPS = 5.0      # Gold wicks are deep
+SR_TOLERANCE_PIPS  = 5.0      
 ZONE_BODY_MULT     = 1.5      
 
 ZONE_LOOKBACK_BARS = 100      
@@ -72,10 +72,8 @@ MAX_DAILY_TRADES   = 3
 INTERVAL = "1h"              
 PERIOD   = "60d"             
 
-PAIRS = [
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
-    "AUDUSD=X", "USDCAD=X", "NZDUSD=X"
-]
+# Gold Futures on Yahoo Finance (Most reliable for intraday data)
+PAIRS = ["GC=F"] 
 
 # ============================================================
 # DATABASE
@@ -349,7 +347,7 @@ def find_supply_demand_zones(df, lookback=ZONE_LOOKBACK_BARS):
 
 def find_liquidity_pools(df, tolerance_pips=3.0,
                          swing_window=5, min_bars_apart=10, max_age_bars=90):
-    pips = 0.0001 if df["close"].iloc[-1] < 10 else 0.01
+    pips = 0.01 # Gold is always > 10
     tol = tolerance_pips * pips
     n = len(df)
     cutoff = max(n - max_age_bars, 0)
@@ -382,7 +380,7 @@ def find_liquidity_pools(df, tolerance_pips=3.0,
 
 def find_support_resistance(df, window=10):
     highs, lows = detect_swing_points(df, window)
-    pips = 0.0001 if df["close"].iloc[-1] < 10 else 0.01
+    pips = 0.01 # Gold
     tol = SR_TOLERANCE_PIPS * pips
     sr = []
     for idx in highs:
@@ -453,7 +451,7 @@ def generate_signal(df, symbol):
             diag["reasons"].append("no_zones")
             return None, diag
 
-        pip = 0.0001 if last_close < 10 else 0.01
+        pip = 0.01 # Gold is always > 10
         spread = SPREAD_BUFFER_PIPS * pip
         signal_date = pd.Timestamp(df.index[-1]).isoformat() 
 
@@ -492,12 +490,15 @@ def generate_signal(df, symbol):
                 diag["reasons"].append("long_stop_too_wide")
                 continue
 
+            # Display "XAUUSD" instead of "GC=F"
+            display_symbol = "XAUUSD" if symbol == "GC=F" else symbol.replace("=X", "")
+
             return {
-                "symbol": symbol.replace("=X", ""), "direction": "LONG",
+                "symbol": display_symbol, "direction": "LONG",
                 "signal_date": signal_date,
-                "entry": round(entry, 5),
-                "stop": round(entry - stop_dist, 5),
-                "target": round(entry + (RR_RATIO * stop_dist), 5),
+                "entry": round(entry, 2), # Gold rounded to 2 decimals
+                "stop": round(entry - stop_dist, 2),
+                "target": round(entry + (RR_RATIO * stop_dist), 2),
                 "risk_pips": round(stop_dist / pip, 1),
                 "atr_pips": round(atr / pip, 1),
                 "atr_multiple": round(stop_dist / atr, 2),
@@ -564,12 +565,15 @@ def update_open_signals():
     cache, updates = {}, []
     for r in rows:
         sym = r["symbol"]
-        if sym not in cache:
+        # Map back to yahoo ticker
+        ticker_sym = "GC=F" if sym == "XAUUSD" else sym + "=X"
+        
+        if ticker_sym not in cache:
             try:
-                cache[sym] = fetch_data(sym + "=X", interval=INTERVAL, period="5d")
+                cache[ticker_sym] = fetch_data(ticker_sym, interval=INTERVAL, period="5d")
             except Exception:
-                cache[sym] = pd.DataFrame()
-        df = cache[sym]
+                cache[ticker_sym] = pd.DataFrame()
+        df = cache[ticker_sym]
         if df.empty:
             continue
 
@@ -637,7 +641,7 @@ async def send_telegram(signal, lot_size, risk_cents, source):
     reward_cents = risk_cents * RR_RATIO
     
     msg = (
-        f"⚡️ *{signal['symbol']} {signal['direction']}* (Trend Pullback)\n"
+        f"🥇 *{signal['symbol']} {signal['direction']}* (Trend Pullback)\n"
         f"━━━━━━━━━━━━━━\n"
         f"Entry: `{signal['entry']}`\n"
         f"Stop Loss: `{signal['stop']}`\n"
@@ -648,7 +652,7 @@ async def send_telegram(signal, lot_size, risk_cents, source):
         f"Risk ≈ {risk_cents:.1f}¢ ({risk_pct:.1f}%)\n"
         f"Max Win ≈ {reward_cents:.1f}¢\n"
         f"Zone: {signal['zone']['type'].capitalize()} "
-        f"({signal['zone']['bottom']:.5f} – {signal['zone']['top']:.5f})\n"
+        f"({signal['zone']['bottom']:.2f} – {signal['zone']['top']:.2f})\n"
         f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
@@ -676,7 +680,7 @@ def run_scan():
 
     started_at = datetime.now(timezone.utc).isoformat()
     run_id = db_insert_run_start(started_at)
-    print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | run_id={run_id} | LONG ONLY + EMA200")
+    print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | run_id={run_id} | GOLD LONG ONLY + EMA200")
 
     pairs_scanned = signals_sent = signals_skipped = errors = 0
     per_pair = []
@@ -738,7 +742,7 @@ def run_scan():
         "errors": errors,
         "per_pair": [
             {
-                "pair": p.replace("=X", ""),
+                "pair": p.replace("=F", "").replace("=X", "") if p != "GC=F" else "XAUUSD",
                 "signal": (
                     {"direction": s["direction"], "entry": s["entry"],
                      "stop": s["stop"], "target": s["target"]}
