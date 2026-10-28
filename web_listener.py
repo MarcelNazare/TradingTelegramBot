@@ -83,7 +83,7 @@ def index():
     try:
         return render_template("index.html")
     except Exception:
-        return "Forex Signal Bot is running.", 200
+        return "Gold Signal Bot is running.", 200
 
 @app.route("/health")
 def health():
@@ -119,7 +119,7 @@ def run_scan():
             result = bot_main.run_scan()
             
             msg = (
-                f"🤖 *Cron Job Triggered*\n"
+                f"🥇 *Gold Cron Job Triggered*\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"Pairs Scanned: `{result.get('pairs_scanned', 0)}`\n"
                 f"Signals Sent: `{result.get('signals_sent', 0)}`\n"
