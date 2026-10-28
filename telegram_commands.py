@@ -1,8 +1,3 @@
-"""
-Telegram command handlers for the Forex Signal Bot.
-Postgres (Neon) edition, Async-safe.
-"""
-
 import os
 import asyncio
 import psycopg2
@@ -74,8 +69,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *Welcome to the Survival Scalp Bot*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "This bot scans the 7 major pairs on the 15-minute timeframe. "
-        "It uses strict 1% risk, ATR stops, and a 1:2 RR.\n\n"
+        "This bot scans the 7 major pairs on the 1-hour timeframe. "
+        "It only takes LONG trades above the 200 EMA.\n\n"
         "*Quick start:*\n"
         "• /help — commands\n"
         "• /status — bot status\n"
@@ -290,9 +285,10 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "ℹ️ *About This Bot*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Survival Scalping Edition.\n"
-        "15-Minute chart, 7 Major Pairs.\n"
-        "1:2 Risk/Reward, 1% Account Risk.\n\n"
+        "Trend-Following Edition.\n"
+        "1-Hour chart, 7 Major Pairs.\n"
+        "Long-Only above 200 EMA.\n"
+        "1:3 Risk/Reward, 1% Account Risk.\n\n"
         "⚠️ *Signals only. Not financial advice.*"
     )
     await _send_with_fallback(update, text)
