@@ -1,6 +1,8 @@
 """
 Forex Supply/Demand + Liquidity Trading Bot
-- SURVIVAL SCALPING EDITION (15-Minute)
+- 1-HOUR TIMEFRAME
+- LONG ONLY + 200 EMA TREND FILTER
+- 1:2 RR, Strict 1% Risk
 """
 
 import warnings
@@ -45,7 +47,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be set.")
 
 # ============================================================
-# CONFIG — SURVIVAL SCALPING MODE (15-Minute Timeframe)
+# CONFIG — 1H TREND-FOLLOWING LONG-ONLY MODE
 # ============================================================
 ACCOUNT_BALANCE    = 300.0    
 RISK_PERCENT       = 1.0      
@@ -60,7 +62,7 @@ MIN_STOP_ATR_MULT = 0.5
 MAX_STOP_ATR_MULT = 1.5       
 
 RR_RATIO           = 2.0      
-RETEST_BUFFER_PIPS = 3.0      # Checks last 3 candles
+RETEST_BUFFER_PIPS = 3.0      
 SR_TOLERANCE_PIPS  = 3.0      
 ZONE_BODY_MULT     = 1.5      
 
@@ -68,8 +70,9 @@ ZONE_LOOKBACK_BARS = 100
 FRESH_ZONES_ONLY   = False
 MAX_DAILY_TRADES   = 3        
 
-INTERVAL = "15m"              
-PERIOD   = "30d"              
+# Changed to 1h and 60d for trend following
+INTERVAL = "1h"              
+PERIOD   = "60d"             
 
 PAIRS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
@@ -405,30 +408,23 @@ def touched_demand(zone, last_low, last_close, buffer_pips, pip):
         return True
     return False
 
-def touched_supply(zone, last_high, last_close, buffer_pips, pip):
-    zlow, zhigh = zone["bottom"], zone["top"]
-    buf = buffer_pips * pip
-    if last_close > zhigh:
-        return False
-    if zlow <= last_high <= zhigh:
-        return True
-    if last_high > zhigh >= last_close:
-        return True
-    if zlow <= last_close <= zhigh:
-        return True
-    if zhigh < last_high <= zhigh + buf:
-        return True
-    return False
-
 # ============================================================
-# SIGNAL GENERATION
+# SIGNAL GENERATION (LONG ONLY + 200 EMA)
 # ============================================================
 def generate_signal(df, symbol):
     diag = {"zones": 0, "sr": 0, "pools": 0, "reasons": []}
 
     try:
-        if len(df) < 60:
-            diag["reasons"].append("insufficient_data")
+        if len(df) < 200:
+            diag["reasons"].append("insufficient_data_for_ema")
+            return None, diag
+        
+        # 200 EMA Trend Filter
+        ema_200 = df["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+        last_close = df["close"].iloc[-1]
+        
+        if last_close < ema_200:
+            diag["reasons"].append("below_200_ema")
             return None, diag
         
         atr = calculate_atr(df).iloc[-1]
@@ -448,13 +444,11 @@ def generate_signal(df, symbol):
             diag["reasons"].append("no_zones")
             return None, diag
 
-        last_close = df["close"].iloc[-1]
         pip = 0.0001 if last_close < 10 else 0.01
         spread = SPREAD_BUFFER_PIPS * pip
-        
         signal_date = pd.Timestamp(df.index[-1]).isoformat() 
 
-        # ---------------- LONG ----------------
+        # ---------------- LONG ONLY ----------------
         for zone in zones:
             if zone["type"] != "demand":
                 continue
@@ -500,54 +494,8 @@ def generate_signal(df, symbol):
                 "zone": zone,
             }, diag
 
-        # ---------------- SHORT ----------------
-        for zone in zones:
-            if zone["type"] != "supply":
-                continue
-                
-            # Check last 3 candles for retest
-            retest_hit = False
-            for i in range(1, 4):
-                if touched_supply(zone, df["high"].iloc[-i], df["close"].iloc[-i], RETEST_BUFFER_PIPS, pip):
-                    retest_hit = True
-                    break
-                    
-            if not retest_hit:
-                diag["reasons"].append("short_no_retest")
-                continue
-                
-            if not any(abs(s["level"] - zone["top"]) <= SR_TOLERANCE_PIPS * pip
-                       for s in sr if s["type"] == "resistance"):
-                diag["reasons"].append("short_no_resistance")
-                continue
-            if any(p["type"] == "equal_highs"
-                   and zone["top"] <= p["level"] <= zone["top"] + 10 * pip
-                   for p in pools):
-                diag["reasons"].append("short_liquidity_trap")
-                continue
-
-            entry = last_close
-            zone_dist = max(zone["top"] - entry, 0.0)
-            raw_dist = zone_dist + ATR_BUFFER_MULT * atr
-            stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
-            if stop_dist > MAX_STOP_ATR_MULT * atr:
-                diag["reasons"].append("short_stop_too_wide")
-                continue
-
-            return {
-                "symbol": symbol.replace("=X", ""), "direction": "SHORT",
-                "signal_date": signal_date,
-                "entry": round(entry, 5),
-                "stop": round(entry + stop_dist, 5),
-                "target": round(entry - (RR_RATIO * stop_dist), 5),
-                "risk_pips": round(stop_dist / pip, 1),
-                "atr_pips": round(atr / pip, 1),
-                "atr_multiple": round(stop_dist / atr, 2),
-                "zone": zone,
-            }, diag
-
         if not diag["reasons"]:
-            diag["reasons"].append("no_matching_direction")
+            diag["reasons"].append("no_long_setup")
         return None, diag
 
     except ValueError:
@@ -679,7 +627,7 @@ async def send_telegram(signal, lot_size, risk_cents, source):
     reward_cents = risk_cents * RR_RATIO
     
     msg = (
-        f"⚡️ *{signal['symbol']} {signal['direction']}* (Scalp)\n"
+        f"⚡️ *{signal['symbol']} {signal['direction']}* (Trend Pullback)\n"
         f"━━━━━━━━━━━━━━\n"
         f"Entry: `{signal['entry']}`\n"
         f"Stop Loss: `{signal['stop']}`\n"
@@ -718,7 +666,7 @@ def run_scan():
 
     started_at = datetime.now(timezone.utc).isoformat()
     run_id = db_insert_run_start(started_at)
-    print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | run_id={run_id}")
+    print(f"[START] {started_at} | Balance={ACCOUNT_BALANCE}¢ | run_id={run_id} | LONG ONLY + EMA200")
 
     pairs_scanned = signals_sent = signals_skipped = errors = 0
     per_pair = []
