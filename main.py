@@ -2,7 +2,6 @@
 Forex Supply/Demand + Liquidity Trading Bot
 - 1-HOUR TREND-FOLLOWING EDITION
 - LONG ONLY + SLOPING 200 EMA
-- 1:3 RR, Wider Stop Tolerance
 """
 
 import warnings
@@ -59,9 +58,9 @@ SPREAD_BUFFER_PIPS = 1.5
 ATR_PERIOD        = 14
 ATR_BUFFER_MULT   = 0.2       
 MIN_STOP_ATR_MULT = 0.5       
-MAX_STOP_ATR_MULT = 2.5       # UPGRADED: Wider stop tolerance for 1H chart
+MAX_STOP_ATR_MULT = 2.5       
 
-RR_RATIO           = 3.0      # UPGRADED: Aiming for 1:3 Risk/Reward
+RR_RATIO           = 3.0      
 RETEST_BUFFER_PIPS = 3.0      
 SR_TOLERANCE_PIPS  = 3.0      
 ZONE_BODY_MULT     = 1.5      
@@ -489,7 +488,6 @@ def generate_signal(df, symbol):
             raw_dist = zone_dist + ATR_BUFFER_MULT * atr
             stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
             
-            # Now using MAX_STOP_ATR_MULT = 2.5
             if stop_dist > MAX_STOP_ATR_MULT * atr:
                 diag["reasons"].append("long_stop_too_wide")
                 continue
