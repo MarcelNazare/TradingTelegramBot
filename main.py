@@ -1,8 +1,8 @@
 """
 Forex Supply/Demand + Liquidity Trading Bot
-- 1-HOUR TIMEFRAME
-- LONG ONLY + 200 EMA TREND FILTER
-- 1:2 RR, Strict 1% Risk
+- 1-HOUR TREND-FOLLOWING EDITION
+- LONG ONLY + SLOPING 200 EMA
+- 1:3 RR, Wider Stop Tolerance
 """
 
 import warnings
@@ -47,7 +47,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be set.")
 
 # ============================================================
-# CONFIG — 1H TREND-FOLLOWING LONG-ONLY MODE
+# CONFIG — 1H TREND-FOLLOWING MODE (LONG ONLY)
 # ============================================================
 ACCOUNT_BALANCE    = 300.0    
 RISK_PERCENT       = 1.0      
@@ -59,9 +59,9 @@ SPREAD_BUFFER_PIPS = 1.5
 ATR_PERIOD        = 14
 ATR_BUFFER_MULT   = 0.2       
 MIN_STOP_ATR_MULT = 0.5       
-MAX_STOP_ATR_MULT = 1.5       
+MAX_STOP_ATR_MULT = 2.5       # UPGRADED: Wider stop tolerance for 1H chart
 
-RR_RATIO           = 2.0      
+RR_RATIO           = 3.0      # UPGRADED: Aiming for 1:3 Risk/Reward
 RETEST_BUFFER_PIPS = 3.0      
 SR_TOLERANCE_PIPS  = 3.0      
 ZONE_BODY_MULT     = 1.5      
@@ -70,7 +70,6 @@ ZONE_LOOKBACK_BARS = 100
 FRESH_ZONES_ONLY   = False
 MAX_DAILY_TRADES   = 3        
 
-# Changed to 1h and 60d for trend following
 INTERVAL = "1h"              
 PERIOD   = "60d"             
 
@@ -266,23 +265,27 @@ def db_get_todays_signal_count():
 # DATA & INDICATORS
 # ============================================================
 def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval, auto_adjust=False)
-        
-        if df.empty:
-            return pd.DataFrame()
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period, interval=interval, auto_adjust=False)
             
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df.columns = ["open", "high", "low", "close", "volume"]
-        df = df.astype(float)
-        
-        if not df.empty:
-            df = df.iloc[:-1]
-        return df
-    except Exception as e:
-        print(f"[DATA ERROR] {symbol}: {e}")
-        return pd.DataFrame()
+            if df.empty:
+                time.sleep(1)
+                continue
+                
+            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            df.columns = ["open", "high", "low", "close", "volume"]
+            df = df.astype(float)
+            
+            if not df.empty:
+                df = df.iloc[:-1]
+            return df
+        except Exception as e:
+            print(f"[DATA ERROR] {symbol} (Attempt {attempt+1}): {e}")
+            time.sleep(1)
+            
+    return pd.DataFrame()
 
 def calculate_atr(df, period=ATR_PERIOD):
     high, low, close = df["high"], df["low"], df["close"]
@@ -409,22 +412,29 @@ def touched_demand(zone, last_low, last_close, buffer_pips, pip):
     return False
 
 # ============================================================
-# SIGNAL GENERATION (LONG ONLY + 200 EMA)
+# SIGNAL GENERATION (LONG ONLY + SLOPING EMA)
 # ============================================================
 def generate_signal(df, symbol):
     diag = {"zones": 0, "sr": 0, "pools": 0, "reasons": []}
 
     try:
-        if len(df) < 200:
+        if len(df) < 220:
             diag["reasons"].append("insufficient_data_for_ema")
             return None, diag
         
-        # 200 EMA Trend Filter
-        ema_200 = df["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+        # 1. TREND FILTER: Price above EMA 200 AND EMA 200 is sloping UP
+        ema_200 = df["close"].ewm(span=200, adjust=False).mean()
+        current_ema = ema_200.iloc[-1]
+        past_ema = ema_200.iloc[-20] # Check EMA from 20 candles ago
+        
         last_close = df["close"].iloc[-1]
         
-        if last_close < ema_200:
-            diag["reasons"].append("below_200_ema")
+        if last_close < current_ema:
+            diag["reasons"].append("price_below_200_ema")
+            return None, diag
+            
+        if current_ema <= past_ema:
+            diag["reasons"].append("200_ema_sloping_down")
             return None, diag
         
         atr = calculate_atr(df).iloc[-1]
@@ -478,6 +488,8 @@ def generate_signal(df, symbol):
             zone_dist = max(entry - zone["bottom"], 0.0)
             raw_dist = zone_dist + ATR_BUFFER_MULT * atr
             stop_dist = max(raw_dist, MIN_STOP_ATR_MULT * atr) + spread
+            
+            # Now using MAX_STOP_ATR_MULT = 2.5
             if stop_dist > MAX_STOP_ATR_MULT * atr:
                 diag["reasons"].append("long_stop_too_wide")
                 continue
