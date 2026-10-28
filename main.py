@@ -68,7 +68,7 @@ ZONE_LOOKBACK_BARS = 100
 FRESH_ZONES_ONLY   = False
 MAX_DAILY_TRADES   = 3        
 
-INTERVAL = "1hr"              
+INTERVAL = "15m"              
 PERIOD   = "30d"              
 
 PAIRS = [
