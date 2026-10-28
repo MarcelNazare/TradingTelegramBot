@@ -5,7 +5,7 @@ import threading
 import traceback
 from pathlib import Path
 
-from flask import Flask, request, abort, jsonify, render_template
+from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
